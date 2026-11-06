@@ -1,0 +1,1379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>COBOL Migration MCP Chat</title>
+  <link rel="stylesheet" href="styles.css">
+  <script type="text/javascript" src="https://unpkg.com/vis-network@9.1.2/standalone/umd/vis-network.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked@11.1.0/marked.min.js"></script>
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({ 
+      startOnLoad: false,
+      theme: 'dark',
+      themeVariables: {
+        primaryColor: '#3b82f6',
+        primaryTextColor: '#e2e8f0',
+        primaryBorderColor: '#60a5fa',
+        lineColor: '#94a3b8',
+        secondaryColor: '#10b981',
+        tertiaryColor: '#f59e0b',
+        background: '#1e293b',
+        mainBkg: '#1e293b',
+        secondBkg: '#334155',
+        textColor: '#e2e8f0',
+        border1: '#475569',
+        border2: '#64748b',
+        fontSize: '14px'
+      }
+    });
+    window.mermaid = mermaid;
+  </script>
+</head>
+<body>
+  <header>
+    <div class="header-content">
+      <div class="header-left">
+        <h1>COBOL Migration Insights</h1>
+        <p>Ask questions about your COBOL code migration</p>
+      </div>
+      <div class="header-right">
+        <div class="db-status-container">
+          <div id="sqlite-status" class="status-indicator" title="SQLite Database">
+            <span class="status-light"></span>
+            <span class="status-label">SQLite</span>
+          </div>
+          <div id="neo4j-status" class="status-indicator" title="Neo4j Graph Database">
+            <span class="status-light"></span>
+            <span class="status-label">Neo4j</span>
+          </div>
+          <div id="ai-model-status" class="status-indicator" title="Chat Model">
+            <span class="status-light"></span>
+            <span class="status-label">Chat Model</span>
+          </div>
+          <div id="codex-model-status" class="status-indicator" title="Code Model">
+            <span class="status-light"></span>
+            <span class="status-label">Code Model</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="run-selector-container">
+      <label for="run-selector">Migration Run:</label>
+      <select id="run-selector" class="run-selector">
+        <option value="">Loading runs...</option>
+      </select>
+      <button id="refresh-runs-btn" class="refresh-runs-btn" title="Refresh runs list">⟳</button>
+      <button id="load-latest-btn" class="load-latest-btn" title="Load the most recent migration run">🔄 Latest</button>
+      <span id="current-run-badge" class="current-run-badge">Run #<span id="current-run-id">--</span></span>
+      <span id="run-status-badge" class="run-status-badge status-idle">⏸️ Idle</span>
+      <span id="run-target-badge" class="run-target-badge">🎯 --</span>
+    </div>
+  </header>
+
+    <main>
+    <section class="panel resources-panel">
+      <div style="display: flex; justify-content: space-between; align-items: center;">
+        <h2>MCP Resources</h2>
+        <button id="refresh-resources" type="button" class="btn-small" title="Refresh resource list">⟳</button>
+      </div>
+      
+      <!-- ═══ Mission Control ═══ -->
+      <div class="mc-panel">
+        <div class="mc-section">
+          <div class="mc-section-title">🚀 Mission Control <button class="mc-info-btn" id="mc-provider-info-btn" title="Learn about AI providers">ℹ️</button></div>
+
+          <!-- Provider Info Panel -->
+          <div class="mc-provider-info" id="mc-provider-info" style="display: none;">
+            <div class="mc-info-close" onclick="document.getElementById('mc-provider-info').style.display='none'">✕</div>
+            <p><strong>☁️ Azure OpenAI</strong> — Your own Azure deployment. Fastest for batch processing. Uses Codex Responses API with built-in reasoning. Supports parallel processing.</p>
+            <p><strong>🤖 GitHub Copilot SDK</strong> — Same models as VS Code Copilot (including Claude). Uses stdio pipe.</p>
+            <p style="font-size:0.8em;color:#94a3b8">Click <strong>🔧 Setup</strong> in the Model panel (or change the provider dropdown) to connect and discover all available models.</p>
+          </div>
+
+          <!-- Run Name + Options -->
+          <div class="mc-options-row">
+            <input type="text" id="mc-run-name" class="mc-input" placeholder="Run name (optional)">
+          </div>
+          <div class="mc-options-row">
+            <select id="mc-provider-select" class="mc-select">
+              <option value="AzureOpenAI">☁️ Azure OpenAI</option>
+              <option value="GitHubCopilot">🤖 GitHub Copilot SDK</option>
+            </select>
+            <select id="mc-model-select" class="mc-select">
+              <!-- Populated dynamically by JS based on provider -->
+            </select>
+          </div>
+          <div class="mc-options-row">
+            <select id="mc-language-select" class="mc-select">
+              <option value="Java">☕ Java (Quarkus)</option>
+              <option value="CSharp">🟦 C# (.NET)</option>
+            </select>
+            <select id="mc-speed-select" class="mc-select">
+              <option value="balanced">⚖️ Balanced</option>
+              <option value="turbo">⚡ Turbo</option>
+              <option value="fast">🏃 Fast</option>
+              <option value="thorough">🔬 Thorough</option>
+            </select>
+          </div>
+
+          <!-- Command Buttons -->
+          <div class="mc-commands">
+            <button class="mc-cmd-btn mc-cmd-primary" data-run-command="migrate" title="Full migration: Analysis + Code Conversion">▶️ Full Migration</button>
+            <button class="mc-cmd-btn" data-run-command="reverse-engineer" title="Reverse engineering only">🔍 RE Only</button>
+            <button class="mc-cmd-btn" data-run-command="convert-only" title="Code conversion only (skip RE)">🔄 Convert Only</button>
+            <button class="mc-cmd-btn" data-run-command="resume" title="Resume interrupted migration">⏩ Resume</button>
+          </div>
+
+          <!-- Stop / Pause Controls -->
+          <div class="mc-controls-row">
+            <span class="mc-status mc-status-pending" id="mc-run-status">⏳ IDLE</span>
+            <button class="mc-ctrl-btn mc-ctrl-pause" id="mc-pause-btn" disabled>⏸️ Pause</button>
+            <button class="mc-ctrl-btn mc-ctrl-stop" id="mc-stop-btn" disabled>🛑 Stop</button>
+          </div>
+
+          <!-- Previous Runs Dropdown -->
+          <div class="mc-run-history">
+            <select id="mc-run-select" class="mc-select mc-run-dropdown">
+              <option value="">No runs yet</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- File Upload -->
+        <div class="mc-section">
+          <div class="mc-section-title">📤 Upload Source Files</div>
+          <div class="mc-upload-area" id="mc-upload-area">
+            <span class="mc-upload-icon">📁</span>
+            <span class="mc-upload-text">Drop .cbl/.cpy files here or click</span>
+            <input type="file" id="mc-file-input" multiple accept=".cbl,.cob,.cpy,.copy,.pco,.sqb" hidden>
+          </div>
+          <div class="mc-upload-status" id="mc-upload-status"></div>
+        </div>
+
+        <!-- Folder Browser -->
+        <div class="mc-section">
+          <div class="mc-section-title">📂 Files</div>
+          <div class="mc-folder-tabs">
+            <button class="mc-tab mc-tab-active" data-folder-tab="source">Source</button>
+            <button class="mc-tab" data-folder-tab="output">Output</button>
+            <button class="mc-tab" data-folder-tab="output/java">Java</button>
+            <button class="mc-tab" data-folder-tab="output/csharp">C#</button>
+          </div>
+          <div class="mc-folder-list" id="mc-folder-list"></div>
+        </div>
+
+        <!-- Report Chat Toggle -->
+        <div class="mc-section">
+          <div class="mc-section-title">💬 Chat Context</div>
+          <div class="mc-report-row">
+            <label class="prompt-toggle" title="Toggle chatting with a report">
+              <input type="checkbox" id="mc-report-toggle">
+              <span class="prompt-toggle-slider"></span>
+            </label>
+            <span class="mc-report-label">Chat with RE Report</span>
+            <span class="mc-report-indicator" id="mc-report-indicator" style="display: none;">📊</span>
+          </div>
+          <select id="mc-report-select" class="mc-select">
+            <option value="">No reports yet</option>
+          </select>
+        </div>
+
+        <!-- Run Log Output -->
+        <div class="mc-section">
+          <div class="mc-section-title" style="display:flex;align-items:center;justify-content:space-between;">
+            📜 Run Output
+            <button class="mc-expand-btn" id="mc-expand-log-btn" title="Expand log view">⛶</button>
+          </div>
+          <pre class="mc-run-log" id="mc-run-log">Waiting for a run to start...</pre>
+        </div>
+      </div>
+
+      <button id="showAllRunsBtn" class="info-button">📊 View All Runs & Data Guide</button>
+      <button id="showArchitectureBtn" class="info-button">📄 Reverse Engineering Results</button>
+      <button id="showMigrationMonitorBtn" class="info-button migration-monitor-btn">🔄 Migration Monitor</button>
+      <div id="resources-list" class="resource-list"></div>
+    </section>
+
+    <section class="panel chat-panel">
+      <h2>Ask a Question</h2>
+
+      <!-- ═══ Model & Prompt Configuration Panel ═══ -->
+      <div class="config-panel" id="config-panel">
+        <div class="config-header" onclick="toggleConfigPanel()">
+          <span class="config-toggle-icon" id="config-toggle-icon">▼</span>
+          <strong>⚙️ Model &amp; Prompts</strong>
+          <span class="config-model-badge" id="config-active-model-badge">loading...</span>
+        </div>
+        <div class="config-body" id="config-body">
+
+          <!-- Source Files Summary -->
+          <div class="config-section" id="source-files-section">
+            <div class="config-section-header">📁 Source Files</div>
+            <div id="source-files-summary" class="source-summary">
+              <span class="source-loading">Scanning...</span>
+            </div>
+            <div id="source-files-warning" class="source-warning" style="display: none;"></div>
+          </div>
+
+          <!-- Model Selector — used for Chat & Prompt Studio -->
+          <div class="config-section">
+            <div class="config-section-header">💬 Chat &amp; Prompt Studio Model
+              <button id="open-setup-modal-btn" class="btn-reconfigure" title="Open AI Provider Setup to discover and configure models">🔧 Setup</button>
+            </div>
+            <div style="font-size: 0.7em; color: #64748b; margin-bottom: 6px;">Select your AI provider and models, or use <code>./doctor.sh setup</code>.</div>
+            <div class="model-selector-row">
+              <select id="model-selector" class="model-dropdown">
+                <!-- Populated dynamically from /api/models/available -->
+                <option value="">Loading models...</option>
+              </select>
+              <button id="apply-model-btn" class="btn-apply" title="Apply model for chat &amp; prompts">✓</button>
+            </div>
+            <div class="model-info-row" id="model-info-row" style="display: none;">
+              <span class="model-publisher" id="model-publisher"></span>
+              <span class="model-context" id="model-context"></span>
+            </div>
+          </div>
+
+          <!-- Prompt Templates -->
+          <div class="config-section">
+            <div class="config-section-header">
+              📝 Agent Prompts
+              <button id="btn-prompt-studio" class="btn-prompt-studio" onclick="openPromptStudio()" title="Open Prompt Studio to generate or AI-enhance all agent prompts">
+                🚀 Prompt Studio
+              </button>
+            </div>
+            <div id="generate-all-status" class="generate-all-status" style="display:none;"></div>
+            <div id="prompt-list" class="prompt-list">
+              <span class="source-loading">Loading prompts...</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      
+      <!-- Suggested Prompts -->
+      <div id="suggestions" class="suggestions">
+        <h3>💡 Try asking:</h3>
+        <div class="suggestion-chips">
+          <button class="suggestion-chip" data-prompt="What are the circular dependencies in this codebase?">🔄 Circular Dependencies</button>
+          <button class="suggestion-chip" data-prompt="Which files are most critical based on their connections?">⭐ Critical Files</button>
+          <button class="suggestion-chip" data-prompt="Show me the impact analysis for ORDMAIN.cbl">📊 Impact Analysis</button>
+          <button class="suggestion-chip" data-prompt="What copybooks are used most frequently?">📚 Copybook Usage</button>
+          <button class="suggestion-chip" data-prompt="Summarize the dependency structure">🗂️ Dependency Summary</button>
+          <button class="suggestion-chip" data-prompt="What are the main programs in this migration?">🎯 Main Programs</button>
+        </div>
+      </div>
+      
+      <form id="chat-form">
+        <label for="prompt">Prompt</label>
+        <textarea id="prompt" rows="5" placeholder="e.g., What are the circular dependencies in this codebase?"></textarea>
+        <button type="submit">Send</button>
+      </form>
+      
+      <!-- Enhanced multi-stage loading indicator -->
+      <div id="loading-indicator" class="loading-indicator" hidden>
+        <div class="loading-stages">
+          <div class="stage" id="stage-db">
+            <div class="stage-icon">
+              <div class="spinner-small"></div>
+            </div>
+            <div class="stage-info">
+              <div class="stage-title">Database Query</div>
+              <div class="stage-status">Fetching migration data...</div>
+            </div>
+          </div>
+          
+          <div class="stage-arrow">→</div>
+          
+          <div class="stage" id="stage-ai">
+            <div class="stage-icon">
+              <div class="spinner-small"></div>
+            </div>
+            <div class="stage-info">
+              <div class="stage-title">AI Model</div>
+              <div class="stage-status">Processing with AI model...</div>
+            </div>
+          </div>
+          
+          <div class="stage-arrow">→</div>
+          
+          <div class="stage" id="stage-response">
+            <div class="stage-icon">
+              <div class="spinner-small"></div>
+            </div>
+            <div class="stage-info">
+              <div class="stage-title">Building Response</div>
+              <div class="stage-status">Formatting results...</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <article id="response" class="response" hidden>
+        <h3>Response</h3>
+        <pre id="response-body"></pre>
+      </article>
+    </section>
+
+    <section class="panel graph-panel" id="main-graph-panel">
+      <div style="display: flex; justify-content: space-between; align-items: center;">
+        <h2>Dependency Graph <span class="run-id-badge" id="graph-run-badge" style="display: none;">| Run <span id="current-run-id">...</span></span></h2>
+        <button id="expand-graph-btn" class="btn-small" title="Expand View" style="background: 334155; color: white; border: 1px solid #475569;">⛶ Expand</button>
+      </div>
+
+      <div class="dashboard-tabs">
+        <button class="dashboard-tab active" data-tab="dependency" onclick="switchDashboard('dependency')">🕸 Dependency Graph</button>
+        <button class="dashboard-tab" data-tab="services" onclick="switchDashboard('services')">🏗️ Architecture</button>
+        <button class="dashboard-tab" data-tab="estate" onclick="switchDashboard('estate')">🛰 Estate Mission Control</button>
+        <button class="dashboard-tab" data-tab="ailoop" onclick="switchDashboard('ailoop')">🔁 AI Loop</button>
+        <button class="dashboard-tab" data-tab="modernization" onclick="switchDashboard('modernization')">🧭 Modernization Intelligence</button>
+        <button class="dashboard-tab" data-tab="ast" onclick="switchDashboard('ast')">🌳 AST Explorer</button>
+        <button class="dashboard-tab" data-tab="programs" onclick="switchDashboard('programs')">🎯 Convert Programs</button>
+        <button class="dashboard-tab" data-tab="explorer" onclick="switchDashboard('explorer')">🔎 Program Explorer</button>
+        <button class="dashboard-tab" data-tab="missing" onclick="switchDashboard('missing')">🧩 Missing Copybooks</button>
+        <span id="rekt-scan-picker" style="margin-left:auto; display:flex; align-items:center; gap:6px;">
+          <label style="color:#94a3b8; font-size:11px;">Scan:</label>
+          <select id="rekt-scan-select" style="padding:4px 8px; background:#1e293b; color:#e2e8f0; border:1px solid #475569; border-radius:4px; font-size:12px;" onchange="window._onScanRunChange && window._onScanRunChange(this.value)">
+            <option value="latest">Latest scan</option>
+            <option value="all">All scans</option>
+          </select>
+        </span>
+      </div>
+      
+      <div class="graph-toolbar">
+        <!-- Controls Section -->
+        <div class="toolbar-section">
+          <div class="section-header" onclick="toggleSection('graph-controls-section')">
+            <span class="toggle-icon">▼</span>
+            <strong>Graph Controls</strong>
+          </div>
+          <div id="graph-controls-section" class="section-content">
+            <div class="control-group">
+              <label for="query-select">Query:</label>
+              <select id="query-select">
+                <option value="full">Full Graph</option>
+                <option value="circular">Circular Deps</option>
+                <option value="critical">Critical Files</option>
+                <option value="programs">Programs Only</option>
+                <option value="copybooks">Copybooks Only</option>
+              </select>
+            </div>
+            <div class="control-group">
+              <label for="layout-select">Layout:</label>
+              <select id="layout-select">
+                <option value="force">Force Directed</option>
+                <option value="hierarchical">Hierarchical</option>
+              </select>
+            </div>
+            <div class="control-group" style="border: 1px solid #fbbf24; padding: 6px 8px; border-radius: 6px; background: #fff8e1;">
+              <label class="filter-checkbox" style="font-weight: 600; color: #92400e; display: flex; gap: 8px; align-items: center;">
+                <input type="checkbox" id="include-inferred-nodes" aria-label="Include inferred nodes (targets not in files table)">
+                <span>Include inferred nodes (missing targets)</span>
+              </label>
+              <div style="font-size: 12px; color: #b45309; margin-top: 4px;">Shows placeholder nodes for dependencies whose files were not scanned.</div>
+            </div>
+            
+            <div class="control-group" style="border: 1px solid #8b5cf6; padding: 6px 8px; border-radius: 6px; background: #f3e8ff; margin-bottom: 8px;">
+               <label class="filter-checkbox" style="font-weight: 600; color: #5b21b6; display: flex; gap: 8px; align-items: center;">
+                 <input type="checkbox" id="analyze-deeper-toggle" checked>
+                 <span>Deep Code Analysis</span>
+               </label>
+               <div style="font-size: 12px; color: #6d28d9; margin-top: 4px;">Shows detailed SQL, CICS, and File I/O dependencies.</div>
+               <button id="view-sql-details-btn" class="btn-prominent">🔍 View SQL Details</button>
+            </div>
+
+            <div class="control-group">
+              <button id="refresh-graph" type="button" class="btn-small">⟳ Refresh</button>
+              <button id="fit-graph" type="button" class="btn-small">⊡ Fit</button>
+              <button id="stabilize-graph" type="button" class="btn-small">⚡ Stabilize</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Node Filters Section -->
+        <div class="toolbar-section">
+          <div class="section-header" onclick="toggleSection('node-filters-section')">
+            <span class="toggle-icon">▼</span>
+            <strong>Node Filters</strong>
+          </div>
+          <div id="node-filters-section" class="section-content">
+            <label class="filter-checkbox">
+              <input type="checkbox" id="show-programs" checked>
+              <span>Programs</span>
+            </label>
+            <label class="filter-checkbox">
+              <input type="checkbox" id="show-copybooks" checked>
+              <span>Copybooks</span>
+            </label>
+            <label class="filter-checkbox">
+              <input type="checkbox" id="show-called-programs" checked>
+              <span>Called Programs</span>
+            </label>
+          </div>
+        </div>
+
+        <!-- Edge Filters Section -->
+        <div class="toolbar-section">
+          <div class="section-header" onclick="toggleSection('edge-filters-section')">
+            <span class="toggle-icon">▼</span>
+            <strong>Edge Filters</strong>
+          </div>
+          <div id="edge-filters-section" class="section-content">
+            <div class="edge-filter-group">
+              <label class="filter-checkbox">
+                <input type="checkbox" id="show-call-edges" checked>
+                <span>CALL</span>
+              </label>
+              <label class="filter-checkbox">
+                <input type="checkbox" id="show-copy-edges" checked>
+                <span>COPY</span>
+              </label>
+              <label class="filter-checkbox">
+                <input type="checkbox" id="show-perform-edges" checked>
+                <span>PERFORM</span>
+              </label>
+              <label class="filter-checkbox">
+                <input type="checkbox" id="show-exec-edges" checked>
+                <span>EXEC</span>
+              </label>
+            </div>
+            <div class="edge-filter-group">
+              <label class="filter-checkbox">
+                <input type="checkbox" id="show-read-edges" checked>
+                <span>READ</span>
+              </label>
+              <label class="filter-checkbox">
+                <input type="checkbox" id="show-write-edges" checked>
+                <span>WRITE</span>
+              </label>
+              <label class="filter-checkbox">
+                <input type="checkbox" id="show-open-edges" checked>
+                <span>OPEN</span>
+              </label>
+              <label class="filter-checkbox">
+                <input type="checkbox" id="show-close-edges" checked>
+                <span>CLOSE</span>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <!-- Legend Section -->
+        <div class="toolbar-section">
+          <div class="section-header" onclick="toggleSection('legend-section')">
+            <span class="toggle-icon">▼</span>
+            <strong>Legend</strong>
+          </div>
+          <div id="legend-section" class="section-content">
+            <div class="legend-grid">
+              <!-- Node Types -->
+              <div class="legend-item">
+                <span class="legend-dot" style="background: #68bdf6"></span>
+                <span>Program</span>
+              </div>
+              <div class="legend-item">
+                <span class="legend-dot" style="background: #f16667"></span>
+                <span>Copybook</span>
+              </div>
+              <div class="legend-item">
+                <span class="legend-dot" style="background: #10b981"></span>
+                <span>Called Prog</span>
+              </div>
+              <!-- Edge Types -->
+              <div class="legend-item">
+                <span class="legend-line" style="background: #10b981"></span>
+                <span>CALL</span>
+              </div>
+              <div class="legend-item">
+                <span class="legend-line" style="background: #3b82f6"></span>
+                <span>COPY</span>
+              </div>
+              <div class="legend-item">
+                <span class="legend-line" style="background: #f59e0b"></span>
+                <span>PERFORM</span>
+              </div>
+              <div class="legend-item">
+                <span class="legend-line" style="background: #8b5cf6"></span>
+                <span>EXEC</span>
+              </div>
+              <div class="legend-item">
+                <span class="legend-line" style="background: #06b6d4"></span>
+                <span>READ</span>
+              </div>
+              <div class="legend-item">
+                <span class="legend-line" style="background: #ec4899"></span>
+                <span>WRITE</span>
+              </div>
+              <div class="legend-item">
+                <span class="legend-line" style="background: #84cc16"></span>
+                <span>OPEN</span>
+              </div>
+              <div class="legend-item">
+                <span class="legend-line" style="background: #ef4444"></span>
+                <span>CLOSE</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="dependency-graph"></div>
+
+      <!-- AST Explorer — what the parser produced for one program, and the source behind it -->
+      <div id="ast-explorer-container" class="dashboard-panel" style="display: none;">
+        <div id="ast-controls" style="padding: 8px; display: flex; gap: 8px; align-items: center; background: rgba(15,23,42,0.8); border-bottom: 1px solid #334155;">
+          <select id="ast-file-select" style="flex: 1; padding: 6px; background: #1e293b; color: #e2e8f0; border: 1px solid #475569; border-radius: 6px; font-size: 13px;">
+            <option value="">Select file to explore...</option>
+          </select>
+          <select id="ast-view-mode" style="padding: 6px; background: #1e293b; color: #e2e8f0; border: 1px solid #475569; border-radius: 6px; font-size: 13px;">
+            <option value="structure">Structure</option>
+            <option value="ast">Raw AST</option>
+          </select>
+          <button onclick="astExplorer?.refresh()" class="btn-small">Refresh</button>
+        </div>
+        <div id="ast-stats-bar" style="padding: 4px 12px; background: rgba(15,23,42,0.6); border-bottom: 1px solid #1e293b; font-size: 12px; color: #94a3b8; display: flex; gap: 12px; align-items: center;"></div>
+        <div style="display: flex; height: calc(100% - 78px);">
+          <div id="ast-graph" style="flex: 3; min-width: 0; overflow-y: auto; border-right: 1px solid #334155;"></div>
+          <div id="ast-source-panel" style="flex: 4; min-width: 0; overflow: hidden; background: #0c1222; border-right: 1px solid #334155;">
+            <div class="source-placeholder">Select a section or paragraph to view source</div>
+          </div>
+          <div id="ast-node-inspector" style="flex: 2; min-width: 180px; max-width: 300px; background: #0f172a; padding: 12px; overflow-y: auto; font-size: 13px; color: #cbd5e1;">
+            <h4 style="margin: 0 0 8px; color: #60a5fa;">Inspector</h4>
+            <div id="ast-inspector-content">Select a paragraph to inspect statements</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Architecture & Services — REKT graph projections -->
+      <div id="services-container" class="dashboard-panel" style="display: none;">
+        <div id="services-controls" style="padding: 8px; display: flex; gap: 8px; align-items: center; background: rgba(15,23,42,0.8); border-bottom: 1px solid #334155;">
+          <span style="color: #60a5fa; font-weight: 600;">🏗️ Architecture</span>
+          <div class="arch-view-toggle" style="display:flex;gap:2px;background:#0f172a;border-radius:6px;padding:2px;border:1px solid #334155;">
+            <button class="arch-mode-btn active" data-mode="layers" onclick="servicesView?.setViewMode('layers')">Layers</button>
+            <button class="arch-mode-btn" data-mode="components" onclick="servicesView?.setViewMode('components')">Components</button>
+            <button class="arch-mode-btn" data-mode="techmap" onclick="servicesView?.setViewMode('techmap')">Tech Map</button>
+            <button class="arch-mode-btn" data-mode="dependencies" onclick="servicesView?.setViewMode('dependencies')">Dependencies</button>
+            <button class="arch-mode-btn" data-mode="modules" onclick="servicesView?.setViewMode('modules')">Modules</button>
+            <button class="arch-mode-btn" data-mode="deadcode" onclick="servicesView?.setViewMode('deadcode')">Reachability</button>
+          </div>
+          <input type="text" id="services-search" placeholder="Search programs..." oninput="servicesView?.searchNode(this.value)" style="flex: 1; padding: 6px 10px; background: #1e293b; color: #e2e8f0; border: 1px solid #475569; border-radius: 6px; font-size: 13px;">
+          <span id="services-stats" style="color: #94a3b8; font-size: 12px; margin-left: auto;">Loading...</span>
+          <button onclick="servicesView?.zoomToFit()" class="btn-small">Fit</button>
+          <button onclick="servicesView?.refresh()" class="btn-small">Refresh</button>
+        </div>
+        <div style="display: flex; height: calc(100% - 42px);">
+          <div id="services-content" style="flex: 1; min-width: 0; position: relative; height: 100%;"></div>
+          <div id="services-legend" style="width: 220px; background: #0f172a; border-left: 1px solid #334155; padding: 12px; overflow-y: auto; font-size: 12px; color: #cbd5e1;">
+            <div id="services-legend-content">
+              <h4 class="sv-legend-title">Legend</h4>
+              <div class="sv-dim">Select a view mode</div>
+            </div>
+            <div id="services-detail" style="margin-top: 16px; border-top: 1px solid #334155; padding-top: 10px;"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Estate Mission Control — clusters, waves and convertible slices -->
+      <div id="estate-mission-control-container" class="dashboard-panel" style="display: none;">
+        <div id="estate-mission-control-root" style="height:100%;overflow:hidden;background:#0a0e1a;"></div>
+      </div>
+      <!-- AI Loop — per-agent model calls and quality gates for a run -->
+      <div id="ai-loop-container" class="dashboard-panel" style="display: none;">
+        <div id="ai-loop-root" style="height:100%;overflow:auto;background:#0a0e1a;"></div>
+      </div>
+      <!-- Modernization Intelligence — deterministic decision surface -->
+      <div id="modernization-intelligence-container" class="dashboard-panel" style="display: none;">
+        <div id="modernization-intelligence-root" style="height:100%;overflow:auto;background:#0a0e1a;"></div>
+      </div>
+      <div id="program-picker-container" class="dashboard-panel" style="display: none;">
+        <div id="program-picker-root" style="height:100%;overflow:auto;background:#0a0e1a;"></div>
+      </div>
+      <div id="missing-copybooks-container" class="dashboard-panel" style="display: none;">
+        <div id="missing-copybooks-root" style="height:100%;overflow:auto;background:#0a0e1a;"></div>      </div>
+      <div id="program-explorer-container" class="dashboard-panel" style="display: none;">
+        <div id="program-explorer-root" style="height:100%;overflow:auto;background:#0a0e1a;"></div>
+      </div>
+      <div id="graph-info" class="graph-info"></div>
+      <div id="node-details" class="node-details" hidden>
+        <h3>Node Details</h3>
+        <button id="close-details" type="button">×</button>
+        <div id="details-content"></div>
+      </div>
+      
+      <!-- Live Activity Dashboard (Collapsible) -->
+      <div id="activity-dashboard-container" style="margin-top: auto; border-top: 1px solid rgba(59, 130, 246, 0.2); padding-top: 15px;"></div>
+    </section>
+  </main>
+
+  <footer>
+    <p>&copy; 2025 COBOL Migration Portal | Powered by Model Context Protocol & Neo4j</p>
+  </footer>
+
+  <!-- All Runs & Data Guide Modal -->
+  <div id="allRunsModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2>📊 All Migration Runs & Data Retrieval Guide</h2>
+        <span class="close">&times;</span>
+      </div>
+      <div class="modal-body">
+        <div class="tabs">
+          <button class="tab-button active" data-tab="runs">All Runs</button>
+          <button class="tab-button" data-tab="sqlite">SQLite Guide</button>
+          <button class="tab-button" data-tab="neo4j">Neo4j Guide</button>
+          <button class="tab-button" data-tab="api">API Guide</button>
+        </div>
+        
+        <div id="runsTab" class="tab-content active">
+          <h3>Available Migration Runs</h3>
+          <div id="runsList" class="runs-list"></div>
+        </div>
+        
+        <div id="sqliteTab" class="tab-content">
+          <h3>📊 SQLite Database Access</h3>
+          <div class="info-box">
+            <p><strong>Location:</strong> <code>Data/migration.db</code></p>
+            <p><strong>Purpose:</strong> Stores migration metadata, COBOL files, analyses, Java code</p>
+          </div>
+          
+          <h4>Common Queries</h4>
+          <div class="query-box">
+            <pre><code>-- List all migration runs
+SELECT id, status, started_at, completed_at, 
+       total_files, successful_conversions 
+FROM migration_runs 
+ORDER BY id DESC;
+
+-- Get files for specific run
+SELECT file_name, file_type, file_path 
+FROM cobol_files 
+WHERE migration_run_id = 43;
+
+-- Get analyses for specific run
+SELECT cobol_file_id, analysis_json 
+FROM analyses 
+WHERE migration_run_id = 43;
+
+-- Get generated Java for specific run
+SELECT file_name, java_code, target_path 
+FROM java_files 
+WHERE migration_run_id = 43;</code></pre>
+          </div>
+          
+          <h4>Access Tools</h4>
+          <ul>
+            <li><strong>sqlite3 CLI:</strong> <code>sqlite3 Data/migration.db</code></li>
+            <li><strong>DB Browser for SQLite:</strong> <a href="https://sqlitebrowser.org/" target="_blank">Download</a></li>
+            <li><strong>VS Code Extension:</strong> Search for "SQLite" by alexcvzz</li>
+          </ul>
+        </div>
+        
+        <div id="neo4jTab" class="tab-content">
+          <h3>🔗 Neo4j Graph Database Access</h3>
+          <div class="info-box">
+            <p><strong>Location:</strong> <code>bolt://localhost:7687</code></p>
+            <p><strong>Browser:</strong> <a href="http://localhost:7474" target="_blank">http://localhost:7474</a></p>
+            <p><strong>Credentials:</strong> username <code>neo4j</code>; password from <code>NEO4J_PASSWORD</code> in <code>Config/ai-config.local.env</code></p>
+            <p><strong>Purpose:</strong> Stores dependency graphs and file relationships</p>
+          </div>
+          
+          <h4>Common Cypher Queries</h4>
+          <div class="query-box">
+            <pre><code>// List all runs
+MATCH (r:Run) 
+RETURN r.runId, r.status, r.totalFiles, r.startedAt 
+ORDER BY r.runId DESC;
+
+// Get all files for specific run
+MATCH (r:Run {runId: 43})-[:CONTAINS]->(f:CobolFile) 
+RETURN f.fileName, f.fileType;
+
+// Get dependencies for specific run
+MATCH (r:Run {runId: 43})-[:CONTAINS]->(source:CobolFile)
+      -[d:DEPENDS_ON]->(target:CobolFile) 
+RETURN source.fileName, target.fileName, d.dependencyType;
+
+// Find circular dependencies
+MATCH (r:Run {runId: 43})-[:CONTAINS]->(f:CobolFile) 
+MATCH path = (f)-[:DEPENDS_ON*2..]->(f) 
+RETURN [node in nodes(path) | node.fileName] as cycle;
+
+// Get critical files (high fan-in)
+MATCH (r:Run {runId: 43})-[:CONTAINS]->(f:CobolFile) 
+OPTIONAL MATCH (f)<-[d:DEPENDS_ON]-() 
+WITH f, count(d) as dependents 
+WHERE dependents > 0 
+RETURN f.fileName, dependents 
+ORDER BY dependents DESC;</code></pre>
+          </div>
+          
+          <h4>Access Tools</h4>
+          <ul>
+            <li><strong>Neo4j Browser:</strong> <a href="http://localhost:7474" target="_blank">Open in Browser</a></li>
+            <li><strong>Cypher Shell:</strong> <code>cypher-shell -a bolt://localhost:7687 -u neo4j -p "$NEO4J_PASSWORD"</code></li>
+            <li><strong>Neo4j Desktop:</strong> <a href="https://neo4j.com/download/" target="_blank">Download</a></li>
+          </ul>
+        </div>
+        
+        <div id="apiTab" class="tab-content">
+          <h3>🌐 MCP API Access</h3>
+          <div class="info-box">
+            <p><strong>Base URL:</strong> <code>http://localhost:5028</code></p>
+            <p><strong>Purpose:</strong> REST API for accessing migration data via MCP</p>
+          </div>
+          
+          <h4>Available Endpoints</h4>
+          <div class="query-box">
+            <pre><code># Get all run IDs
+curl http://localhost:5028/api/runs/all
+
+# Get dependencies for specific run
+curl http://localhost:5028/api/runs/43/dependencies | jq '.'
+
+# List all MCP resources
+curl http://localhost:5028/api/resources
+
+# Ask questions via chat
+curl -X POST http://localhost:5028/api/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"Show me all dependencies for run 43"}'
+
+# Get current run info
+curl http://localhost:5028/api/runinfo
+
+# Get data retrieval guide (this info as JSON)
+curl http://localhost:5028/api/data-retrieval-guide</code></pre>
+          </div>
+          
+          <h4>MCP Resource URIs</h4>
+          <ul>
+            <li><code>insights://runs/{runId}/summary</code> - Migration run overview</li>
+            <li><code>insights://runs/{runId}/files</code> - All COBOL files list</li>
+            <li><code>insights://runs/{runId}/graph</code> - Full dependency graph</li>
+            <li><code>insights://runs/{runId}/circular-dependencies</code> - Circular deps</li>
+            <li><code>insights://runs/{runId}/critical-files</code> - High-impact files</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Reverse Engineering Results Modal -->
+  <div id="architectureModal" class="modal">
+    <div class="modal-content modal-content-wide">
+      <div class="modal-header">
+        <h2>🔬 Reverse Engineering Results</h2>
+        <span class="close arch-close">&times;</span>
+      </div>
+      <div class="modal-body">
+        <div id="reportTab" class="doc-tab-content active">
+          <div class="doc-toolbar">
+            <button id="downloadReportBtn" class="doc-button">⬇️ Download Report</button>
+            <button id="copyReportBtn" class="doc-button">📋 Copy to Clipboard</button>
+            <button id="refreshReportBtn" class="doc-button">🔄 Refresh</button>
+            <span id="reportLastModified" class="doc-meta"></span>
+          </div>
+          <div id="reportContent" class="doc-content">
+            <p>Loading reverse engineering report...</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Unified Migration Monitor Modal -->
+  <div id="migrationMonitorModal" class="modal">
+    <div class="modal-content modal-content-wide migration-monitor-modal">
+      <div class="modal-header">
+        <h2>🔄 Migration Monitor</h2>
+        <span class="close migration-monitor-close">&times;</span>
+      </div>
+      <div class="modal-body">
+        <div class="monitor-tabs">
+          <button class="monitor-tab-btn active" data-tab="overview">📊 Overview</button>
+          <button class="monitor-tab-btn" data-tab="migrationLog">📄 Migration Log</button>
+          <button class="monitor-tab-btn" data-tab="chunks">🧩 Chunks</button>
+          <button class="monitor-tab-btn" data-tab="agents">💬 Agent Chat</button>
+          <button class="monitor-tab-btn" data-tab="logs">📜 Logs</button>
+        </div>
+        
+        <!-- Overview Tab - Process Flowchart + Stats -->
+        <div id="overviewTab" class="monitor-tab-content active">
+          <!-- Overall Progress Bar -->
+          <div class="overall-progress-section">
+            <div class="overall-progress-header">
+              <span class="overall-progress-title">📈 Overall Migration Progress</span>
+              <span class="overall-progress-percent" id="overallProgressPercent">0%</span>
+            </div>
+            <div class="overall-progress-bar-container">
+              <div class="overall-progress-bar-track">
+                <div class="overall-progress-bar-fill" id="overallProgressFill" style="width: 0%"></div>
+              </div>
+            </div>
+            <div class="overall-progress-stats">
+              <span class="progress-stat" id="overallProgressStatus">Waiting for migration...</span>
+              <span class="progress-stat" id="overallProgressTarget">Target: --</span>
+              <span class="progress-stat" id="parallelWorkers">🚀 Workers: --</span>
+            </div>
+          </div>
+          
+          <div class="monitor-header">
+            <div class="monitor-run-info">
+              <span class="run-label">Run:</span>
+              <span id="monitorRunId">-</span>
+              <span class="run-status" id="monitorRunStatus">-</span>
+            </div>
+            <div class="monitor-stats">
+              <div class="stat-card">
+                <span class="stat-value" id="monitorProgress">0%</span>
+                <span class="stat-label">Progress</span>
+              </div>
+              <div class="stat-card">
+                <span class="stat-value" id="monitorChunks">0/0</span>
+                <span class="stat-label">Chunks</span>
+              </div>
+              <div class="stat-card">
+                <span class="stat-value" id="monitorTokens">0</span>
+                <span class="stat-label">Tokens</span>
+              </div>
+              <div class="stat-card">
+                <span class="stat-value" id="monitorTime">0s</span>
+                <span class="stat-label">Time</span>
+              </div>
+            </div>
+            <button id="refreshMonitorBtn" class="refresh-btn">⟳ Refresh</button>
+          </div>
+          
+          <div class="monitor-content-grid">
+            <!-- Left: Process Flowchart -->
+            <div class="monitor-flowchart-panel">
+              <h3>Process Pipeline</h3>
+              <div class="process-flowchart" id="monitorFlowchart">
+                <!-- Stages populated by JS -->
+              </div>
+            </div>
+            
+            <!-- Right: Quick Stats & Recent Activity -->
+            <div class="monitor-sidebar">
+              <div class="sidebar-section">
+                <h4>📦 Chunk Summary</h4>
+                <div class="chunk-quick-stats">
+                  <div class="quick-stat pending"><span id="qsPending">0</span> Pending</div>
+                  <div class="quick-stat processing"><span id="qsProcessing">0</span> Processing</div>
+                  <div class="quick-stat completed"><span id="qsCompleted">0</span> Completed</div>
+                  <div class="quick-stat failed"><span id="qsFailed">0</span> Failed</div>
+                </div>
+              </div>
+              
+              <div class="sidebar-section">
+                <h4>📡 Recent Activity</h4>
+                <div class="recent-activity-mini" id="recentActivityMini">
+                  <p class="placeholder-text">No recent activity</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        
+        <!-- Migration Log Tab - Real-time process log viewer -->
+        <div id="migrationLogTab" class="monitor-tab-content">
+          <div class="migration-log-header">
+            <div class="migration-log-info">
+              <span class="target-language-badge" id="migrationTargetLanguage">--</span>
+              <span class="migration-status-text" id="migrationStatusText">Ready</span>
+            </div>
+            <div class="migration-log-controls">
+              <label class="auto-scroll-toggle">
+                <input type="checkbox" id="migrationLogAutoScroll" checked>
+                <span>Auto-scroll</span>
+              </label>
+              <button id="refreshMigrationLogBtn" class="refresh-btn">⟳ Refresh</button>
+            </div>
+          </div>
+          <div class="migration-log-container">
+            <div class="migration-log-window" id="migrationLogWindow">
+              <div class="migration-log-entries" id="migrationLogEntries">
+                <p class="loading-text">Loading migration log...</p>
+              </div>
+            </div>
+          </div>
+          <div class="live-activity-grid">
+            <div class="live-log-panel">
+              <div class="panel-title">🖥️ Live Run Log (latest file)</div>
+              <div class="live-log-window" id="liveRunLogWindow">
+                <div class="live-log-entries" id="liveRunLogEntries">
+                  <p class="placeholder-text">Waiting for log lines...</p>
+                </div>
+              </div>
+            </div>
+            <div class="active-files-panel">
+              <div class="panel-title">📂 Active Files</div>
+              <div class="active-files-list" id="activeFilesList">
+                <p class="placeholder-text">Waiting for activity...</p>
+              </div>
+            </div>
+          </div>
+          <div class="migration-log-footer">
+            <span id="migrationLogCount">0 entries</span>
+            <span id="migrationLogLastUpdate">Last update: --</span>
+          </div>
+        </div>
+        
+        <!-- Chunks Tab - Detailed chunk progress -->
+        <div id="chunksTab" class="monitor-tab-content">
+          <div class="chunks-header">
+            <div class="chunks-overall-progress">
+              <div class="overall-progress-info">
+                <span class="progress-label">Overall Progress:</span>
+                <span class="progress-value" id="overallChunkProgress">0%</span>
+                <span class="progress-detail">(<span id="completedChunks">0</span>/<span id="totalChunksCount">0</span> chunks)</span>
+              </div>
+              <div class="overall-progress-bar">
+                <div class="progress-fill" id="overallChunkProgressBar" style="width: 0%"></div>
+              </div>
+            </div>
+            <button id="refreshChunksBtn" class="refresh-btn">⟳ Refresh</button>
+          </div>
+          
+          <div class="chunks-content">
+            <div class="chunks-file-list" id="chunkFilesList">
+              <p class="loading-text">Loading chunk data...</p>
+            </div>
+            
+            <div id="chunkDetails" class="chunk-details-panel" style="display: none;">
+              <h4>Chunk Details: <span id="chunkDetailsFile">-</span></h4>
+              <div id="chunkDetailsContent" class="chunk-details-content"></div>
+            </div>
+          </div>
+        </div>
+        
+        <!-- Agent Chat Tab -->
+        <div id="agentsTab" class="monitor-tab-content">
+          <div class="agents-header">
+            <div class="agent-filter">
+              <label>Filter:</label>
+              <select id="agentFilter" title="Filter by agent type">
+                <option value="">All Agents</option>
+                <option value="CobolAnalyzer">🔬 Cobol Analyzer</option>
+                <option value="BusinessLogicExtractor">💼 Business Logic</option>
+                <option value="DependencyMapper">🔗 Dependency Mapper</option>
+                <option value="CSharpConverter">⚙️ C# Converter</option>
+                <option value="JavaConverter">☕ Java Converter</option>
+              </select>
+            </div>
+            <div class="agents-controls">
+              <label class="auto-scroll-toggle">
+                <input type="checkbox" id="agentChatAutoScroll" checked>
+                <span>Auto-scroll</span>
+              </label>
+              <button id="expandAllAgentsBtn" class="expand-btn">📖 Expand All</button>
+              <button id="collapseAllAgentsBtn" class="expand-btn">📕 Collapse All</button>
+              <button id="refreshAgentsBtn" class="refresh-btn">⟳ Refresh</button>
+            </div>
+          </div>
+          
+          <div class="conversations-list" id="conversationsList">
+            <p class="loading-text">Loading agent conversations...</p>
+          </div>
+        </div>
+
+        <!-- Logs Tab - Scrollable log windows -->
+        <div id="logsTab" class="monitor-tab-content">
+          <div class="logs-header">
+            <div class="log-type-selector">
+              <button class="log-type-btn active" data-log="all">📋 All Logs</button>
+              <button class="log-type-btn" data-log="console">🖥️ Console</button>
+              <button class="log-type-btn" data-log="agents">🤖 Agents</button>
+              <button class="log-type-btn" data-log="api">📡 API Calls</button>
+            </div>
+            <div class="logs-controls">
+              <label class="auto-scroll-toggle">
+                <input type="checkbox" id="logAutoScroll" checked>
+                <span>Auto-scroll</span>
+              </label>
+              <button id="clearLogsBtn" class="clear-logs-btn">🗑️ Clear</button>
+              <button id="refreshLogsBtn" class="refresh-btn">⟳ Refresh</button>
+            </div>
+          </div>
+          <div class="logs-container">
+            <div class="log-window" id="logWindow">
+              <div class="log-entries" id="logEntries">
+                <p class="loading-text">Loading logs...</p>
+              </div>
+            </div>
+          </div>
+          <div class="log-stats">
+            <span id="logCount">0 entries</span>
+            <span id="logLastUpdate">Last update: --</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SQL Details Modal -->
+  <div id="sqlDetailsModal" class="modal">
+    <div class="modal-content modal-content-wide">
+      <div class="modal-header">
+        <h2>🗄️ SQL & Data Access Details</h2>
+        <span class="close sql-close">&times;</span>
+      </div>
+      <div class="modal-body">
+        <div class="sql-toolbar" style="margin-bottom: 15px;">
+           <input type="text" id="sqlSearch" placeholder="Filter tables or programs..." style="padding: 8px; border-radius: 4px; border: 1px solid #cbd5e1; width: 300px;">
+        </div>
+        <div class="sql-content" id="sqlDetailsContent">
+          <p>Loading SQL details...</p>
+        </div>
+      </div>
+    </div>
+  </div>
+  
+  <!-- Prompt Enhancement Dashboard Modal -->
+  <div id="enhanceDashboardModal" class="modal">
+    <div class="modal-content modal-content-wide enhance-dashboard">
+      <div class="modal-header enhance-dashboard-header">
+        <h2>🚀 Prompt Studio</h2>
+        <span class="close enhance-dashboard-close" onclick="closeEnhanceDashboard()">&times;</span>
+      </div>
+      <div class="modal-body enhance-dashboard-body">
+
+        <!-- ═══ MODE PICKER (shown before generation starts) ═══ -->
+        <div id="studio-mode-picker" class="studio-mode-picker">
+          <div class="studio-intro">Choose how to generate prompts for all 7 agents based on your COBOL source files.</div>
+
+          <!-- Quick Mode Card -->
+          <div class="studio-mode-card" id="mode-card-quick">
+            <div class="mode-card-icon">⚡</div>
+            <div class="mode-card-body">
+              <div class="mode-card-title">Quick Generate <span class="mode-card-tag tag-fast">Instant</span> <span class="mode-card-tag tag-free">Free</span></div>
+              <div class="mode-card-desc">
+                Scans your source files with <strong>regex pattern matching</strong> to detect COBOL features
+                (EXEC SQL, CICS screens, file I/O, copybooks, etc.) and builds tailored prompts from templates.
+              </div>
+              <ul class="mode-card-details">
+                <li>Detects architecture pattern (online-interactive, batch, file-processing)</li>
+                <li>Generates system + user prompts for all agents</li>
+                <li>No AI model needed — pure code analysis</li>
+                <li>Completes in under 1 second</li>
+              </ul>
+              <button class="btn-studio-go btn-studio-quick" onclick="runPromptStudio('quick')">⚡ Generate Now</button>
+            </div>
+          </div>
+
+          <!-- AI-Enhanced Mode Card -->
+          <div class="studio-mode-card mode-card-ai" id="mode-card-ai">
+            <div class="mode-card-icon">🧠</div>
+            <div class="mode-card-body">
+              <div class="mode-card-title">AI-Enhanced Generate <span class="mode-card-tag tag-ai">AI-Powered</span> <span class="mode-card-tag tag-deep">Deep Analysis</span></div>
+              <div class="mode-card-desc">
+                Runs the same regex analysis first, then sends <strong>actual COBOL code samples</strong>
+                to your selected AI model. The AI reviews your codebase and adds domain-specific
+                enhancements the regex can't detect (naming conventions, business logic patterns,
+                Danish-language variables, error handling idioms, etc.).
+              </div>
+              <ul class="mode-card-details">
+                <li>Everything from Quick Generate, plus:</li>
+                <li>Samples 3 largest programs + 2 largest copybooks</li>
+                <li>One AI call reviews all agents at once (~4K tokens)</li>
+                <li>AI assigns quality scores (1-10) per agent prompt</li>
+                <li>Takes 10-30 seconds depending on model speed</li>
+              </ul>
+              <div class="studio-ai-model-info" id="studio-ai-model-info">
+                <span class="studio-ai-label">AI Service:</span>
+                <span class="studio-ai-model" id="studio-ai-model-name">Loading...</span>
+                <span class="studio-ai-provider" id="studio-ai-provider"></span>
+              </div>
+              <button class="btn-studio-go btn-studio-ai" id="btn-studio-ai" onclick="runPromptStudio('ai')">🧠 Generate with AI Enhancement</button>
+            </div>
+          </div>
+
+          <div class="studio-hint">
+            💡 <strong>Tip:</strong> Start with Quick Generate to see what regex detects. Use AI-Enhanced when you want
+            the model to review your actual code and fine-tune the prompts with domain-specific intelligence.
+          </div>
+        </div>
+
+        <!-- ═══ PROGRESS VIEW (shown during generation) ═══ -->
+        <div id="studio-progress" class="studio-progress" style="display:none;">
+          <div class="studio-progress-mode" id="studio-progress-mode"></div>
+
+          <!-- Phase Progress -->
+          <div class="enhance-phases">
+            <div id="enhance-phase-1" class="enhance-phase">
+              <div class="phase-indicator pending"><span class="phase-number">1</span></div>
+              <div class="phase-info">
+                <div class="phase-title">Source Analysis</div>
+                <div class="phase-detail" id="phase-1-detail">Scanning COBOL files with regex patterns...</div>
+              </div>
+              <div class="phase-timing" id="phase-1-timing"></div>
+            </div>
+            <div id="enhance-phase-2" class="enhance-phase">
+              <div class="phase-indicator pending"><span class="phase-number">2</span></div>
+              <div class="phase-info">
+                <div class="phase-title">Base Prompt Generation</div>
+                <div class="phase-detail" id="phase-2-detail">Building prompts from detected features...</div>
+              </div>
+              <div class="phase-timing" id="phase-2-timing"></div>
+            </div>
+            <div id="enhance-phase-3" class="enhance-phase" style="display:none;">
+              <div class="phase-indicator pending"><span class="phase-number">3</span></div>
+              <div class="phase-info">
+                <div class="phase-title">AI Enhancement</div>
+                <div class="phase-detail" id="phase-3-detail">Sending code samples to AI for domain-specific insights...</div>
+              </div>
+              <div class="phase-timing" id="phase-3-timing"></div>
+            </div>
+            <div id="enhance-phase-4" class="enhance-phase">
+              <div class="phase-indicator pending"><span class="phase-number">4</span></div>
+              <div class="phase-info">
+                <div class="phase-title">Save to Disk</div>
+                <div class="phase-detail" id="phase-4-detail">Writing prompts to Agents/Prompts/*.md files...</div>
+              </div>
+              <div class="phase-timing" id="phase-4-timing"></div>
+            </div>
+          </div>
+
+          <!-- Analysis Summary -->
+          <div id="enhance-analysis-summary" class="enhance-analysis-summary" style="display:none;">
+            <div class="enhance-analysis-row">
+              <span class="enhance-stat" id="enhance-stat-files">—</span>
+              <span class="enhance-stat" id="enhance-stat-programs">—</span>
+              <span class="enhance-stat" id="enhance-stat-copybooks">—</span>
+              <span class="enhance-stat" id="enhance-stat-lines">—</span>
+              <span class="enhance-stat" id="enhance-stat-arch">—</span>
+            </div>
+            <div class="enhance-features" id="enhance-feature-tags"></div>
+          </div>
+
+          <!-- AI Model Badge -->
+          <div id="enhance-ai-badge" class="enhance-ai-badge" style="display:none;">
+            <span class="ai-badge-icon">🤖</span>
+            <span class="ai-badge-label">Model:</span>
+            <span id="enhance-ai-model-name">—</span>
+            <span id="enhance-ai-status" class="ai-badge-status">working...</span>
+          </div>
+
+          <!-- Quality Score Info Box -->
+          <div id="enhance-quality-info" class="quality-info-box" style="display:none;">
+            <div class="quality-info-header">
+              <span class="quality-info-icon">ℹ️</span>
+              <span class="quality-info-title">Quality Score Explained</span>
+              <button class="quality-info-close" onclick="this.parentElement.parentElement.style.display='none'">✕</button>
+            </div>
+            <div class="quality-info-body">
+              <p>The <strong>Quality Score (1–10)</strong> rates the <em>final</em> prompt quality after AI enhancement — how ready it is for accurate code conversion.</p>
+              <div class="quality-info-scale">
+                <div class="qi-tier high"><span class="qi-badge">8–10</span> <strong>Production-ready</strong> — comprehensive domain coverage, naming conventions, edge cases, and COBOL idioms captured.</div>
+                <div class="qi-tier medium"><span class="qi-badge">5–7</span> <strong>Adequate</strong> — covers basics but may miss codebase-specific patterns or data structures.</div>
+                <div class="qi-tier low"><span class="qi-badge">1–4</span> <strong>Needs work</strong> — significant domain gaps; consider adding more source files or re-running.</div>
+              </div>
+              <p class="quality-info-tip"><strong>How to improve scores:</strong> Ensure the <code>source/</code> folder contains representative COBOL programs and copybooks. The AI samples the largest files — include your most complex programs for best results. Re-running enhancement after adding more source files will improve coverage.</p>
+            </div>
+          </div>
+
+          <!-- Agent Quality Cards -->
+          <div id="enhance-agent-cards" class="enhance-agent-cards" style="display:none;"></div>
+
+          <!-- Sampled Files -->
+          <div id="enhance-sampled-files" class="enhance-sampled-files" style="display:none;"></div>
+
+          <!-- Final Summary -->
+          <div id="enhance-final-summary" class="enhance-final-summary" style="display:none;"></div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+  <!-- Prompt Editor Modal -->
+  <div id="promptEditorModal" class="modal">
+    <div class="modal-content modal-content-wide">
+      <div class="modal-header">
+        <h2>📝 Edit Prompt: <span id="prompt-editor-title"></span></h2>
+        <span class="close prompt-editor-close">&times;</span>
+      </div>
+      <div class="modal-body">
+        <!-- Source analysis banner (shown after auto-generate) -->
+        <div id="prompt-analysis-banner" class="prompt-analysis-banner" style="display:none;">
+          <div class="analysis-header">
+            <span class="analysis-icon">🔍</span>
+            <strong>Source Analysis</strong>
+            <span id="analysis-arch-badge" class="analysis-badge"></span>
+          </div>
+          <div id="analysis-features" class="analysis-features"></div>
+          <div id="analysis-stats" class="analysis-stats"></div>
+        </div>
+
+        <div class="prompt-editor-layout">
+          <div class="prompt-editor-section">
+            <label class="prompt-editor-label">System Prompt</label>
+            <textarea id="prompt-editor-system" class="prompt-editor-textarea" rows="12" placeholder="System prompt..."></textarea>
+          </div>
+          <div class="prompt-editor-section">
+            <label class="prompt-editor-label">
+              User Prompt Template
+              <button id="prompt-auto-generate-btn" class="btn-auto-generate" title="Auto-generate optimized prompt based on source files">⚡ Auto-Generate</button>
+            </label>
+            <textarea id="prompt-editor-user" class="prompt-editor-textarea" rows="12" placeholder="User prompt template..."></textarea>
+          </div>
+          <div class="prompt-editor-actions">
+            <button id="prompt-editor-save" class="btn-save">💾 Save to File</button>
+            <button id="prompt-editor-cancel" class="btn-cancel">Cancel</button>
+            <span id="prompt-save-status" class="prompt-save-status"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ Model Setup Modal ═══ -->
+  <div id="modelSetupModal" class="modal" style="display: none;">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2>🔑 AI Provider Setup</h2>
+        <span class="modal-close" id="setup-modal-close">&times;</span>
+      </div>
+      <div class="modal-body" style="padding: 20px;">
+
+        <!-- Tabs -->
+        <div class="setup-tabs">
+          <button class="setup-tab setup-tab-active" data-provider="AzureOpenAI">☁️ Azure OpenAI</button>
+          <button class="setup-tab" data-provider="GitHubCopilotSDK">🤖 GitHub Copilot SDK</button>
+        </div>
+
+        <!-- Azure OpenAI Tab -->
+        <div id="setup-AzureOpenAI" class="setup-tab-content" style="display: block;">
+          <div class="setup-field">
+            <label>Endpoint URL</label>
+            <input type="text" id="azure-endpoint" placeholder="https://your-resource.openai.azure.com/">
+            <div class="setup-help">Find this in Azure Portal → Your OpenAI Resource → Keys and Endpoint</div>
+          </div>
+
+          <div class="setup-field">
+            <label>Authentication</label>
+            <div class="setup-auth-options">
+              <label class="setup-auth-option">
+                <input type="radio" name="azure-auth" value="apikey" checked>
+                🔑 API Key
+              </label>
+              <label class="setup-auth-option">
+                <input type="radio" name="azure-auth" value="azlogin">
+                🔐 Azure CLI (az login)
+              </label>
+            </div>
+          </div>
+
+          <div class="setup-field" id="azure-apikey-group">
+            <label>API Key</label>
+            <input type="password" id="azure-apikey" placeholder="Enter your Azure OpenAI API key">
+          </div>
+
+          <button class="setup-connect-btn" id="azure-connect-btn">🔌 Connect</button>
+        </div>
+
+        <!-- GitHub Copilot SDK Tab -->
+        <div id="setup-GitHubCopilotSDK" class="setup-tab-content">
+          <div class="setup-field">
+            <label>Authentication</label>
+            <div class="setup-auth-options">
+              <label class="setup-auth-option">
+                <input type="radio" name="copilot-auth" value="cli" checked>
+                💻 Copilot CLI (copilot login)
+              </label>
+              <label class="setup-auth-option">
+                <input type="radio" name="copilot-auth" value="pat">
+                🔑 Fine-grained personal access token
+              </label>
+            </div>
+            <div class="setup-help">Uses the account you signed in with <code>copilot login</code> on the server. <code>GH_TOKEN</code> and <code>GITHUB_TOKEN</code> are ignored in this mode.</div>
+          </div>
+
+          <div class="setup-field" id="copilot-pat-group" style="display: none;">
+            <label>Personal Access Token</label>
+            <input type="password" id="copilot-pat" placeholder="github_pat_...">
+            <div class="setup-help">Fine-grained token with the <b>Copilot Requests</b> account permission (classic <code>ghp_</code> tokens do not work). Create at github.com/settings/personal-access-tokens/new. Saved as <code>COPILOT_GITHUB_TOKEN</code>.</div>
+          </div>
+
+          <button class="setup-connect-btn" id="copilot-connect-btn">🔌 Connect</button>
+        </div>
+
+        <!-- Status -->
+        <div id="setup-status" class="setup-status"></div>
+
+        <!-- Discovered Models -->
+        <div id="setup-model-list">
+          <div class="setup-no-models">Connect to a provider to discover available models.</div>
+        </div>
+      </div>
+
+      <!-- Footer -->
+      <div class="setup-footer">
+        <span class="setup-footer-hint">Configuration is saved to Config/ai-config.local.env</span>
+        <button class="setup-save-btn" id="setup-save-btn" disabled>💾 Save & Apply</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="run-selector.js"></script>
+  <script src="graph.js"></script>
+  <script src="main.js"></script>
+  <script src="runs-viewer.js"></script>
+  <script src="activity-dashboard.js"></script>
+  <script src="migration-monitor.js"></script>
+  <script src="model-prompt-panel.js"></script>
+  <script src="model-setup-modal.js"></script>
+  <script src="mission-control.js"></script>
+  <script src="ast-explorer.js"></script>
+  <script src="services-view.js"></script>
+  <script src="modernization-intelligence.js"></script>
+  <!-- Cytoscape + fCoSE (MIT, see lib/cytoscape/LICENSE.*) for the estate graph -->
+  <script src="lib/cytoscape/cytoscape.min.js"></script>
+  <script src="lib/cytoscape/layout-base.js"></script>
+  <script src="lib/cytoscape/cose-base.js"></script>
+  <script src="lib/cytoscape/cytoscape-fcose.js"></script>
+  <script src="estate-mission-control.js"></script>
+  <script src="ai-loop.js"></script>
+  <script src="program-picker.js"></script>
+  <script src="missing-copybooks.js"></script>
+  <script src="program-explorer.js"></script>
+  <script src="dashboard-tabs.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({ startOnLoad: false, theme: 'dark', securityLevel: 'strict' });
+    window.mermaid = mermaid;
+  </script>
+  <script>
+    // Toggle collapsible sections
+    function toggleSection(sectionId) {
+      const section = document.getElementById(sectionId);
+      if (!section) {
+        console.error('Section not found:', sectionId);
+        return;
+      }
+      
+      // Find the header within the same parent
+      const parent = section.parentElement;
+      const header = parent.querySelector('.section-header');
+      const icon = header ? header.querySelector('.toggle-icon') : null;
+      
+      if (section.style.display === 'none' || section.style.display === '') {
+        section.style.display = 'flex';
+        if (icon) icon.textContent = '▼';
+      } else {
+        section.style.display = 'none';
+        if (icon) icon.textContent = '▶';
+      }
+    }
+
+    // Global polling pause when tab is not visible (reduces CPU when tab is in background)
+    window.pageIsVisible = true;
+    document.addEventListener('visibilitychange', () => {
+      window.pageIsVisible = !document.hidden;
+      console.log('[Polling] Tab visibility changed:', window.pageIsVisible ? 'visible' : 'hidden');
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,4780 @@
+#!/bin/bash
+
+# COBOL Migration Tool - All-in-One Management Script
+# ===================================================
+# This script consolidates all functionality for setup, testing, running, and diagnostics
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+# Variable for the GitHub host, defaults to 'github.com'
+GITHUB_HOST="${GITHUB_HOST:-github.com}"
+GITHUB_HOST="${GITHUB_HOST#https://}"
+GITHUB_HOST="${GITHUB_HOST#http://}"
+
+# Resolve the sqlite3 command, handling Windows (Git Bash / MSYS2) paths
+SQLITE3_CMD=""
+resolve_sqlite3() {
+    if [ -n "$SQLITE3_CMD" ]; then return 0; fi
+    if command -v sqlite3 >/dev/null 2>&1; then
+        SQLITE3_CMD="sqlite3"
+    elif command -v sqlite3.exe >/dev/null 2>&1; then
+        SQLITE3_CMD="sqlite3.exe"
+    else
+        local winget_match
+        winget_match=$(find "${LOCALAPPDATA:-/dev/null}/Microsoft/WinGet/Packages" -name "sqlite3.exe" 2>/dev/null | head -1)
+        if [ -n "$winget_match" ]; then
+            SQLITE3_CMD="$winget_match"
+        fi
+    fi
+    [ -n "$SQLITE3_CMD" ]
+}
+
+# Get repository root (directory containing this script)
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tools/lib/ports.sh
+source "$REPO_ROOT/tools/lib/ports.sh"
+
+# Read a single key from the local config, without quotes, empty when absent.
+# Neo4j fixes each instance's password in its data volume on first start and ignores the
+# setting afterwards, so a value that opens an existing volume has to survive re-running setup.
+read_local_config_value() {
+    local key="$1"
+    local file="${2:-$REPO_ROOT/Config/ai-config.local.env}"
+    [[ -f "$file" ]] || return 0
+
+    local line
+    line=$(grep -E "^${key}=" "$file" 2>/dev/null | tail -1) || true
+    [[ -n "$line" ]] || return 0
+
+    local value="${line#"${key}"=}"
+    value="${value%\"}"; value="${value#\"}"
+    value="${value%\'}"; value="${value#\'}"
+    printf '%s' "$value"
+}
+
+# Setup owns the AI provider keys and rewrites them; every other key in the previous file
+# (Neo4j passwords, container names and ports, folders, tuning) is put back with its old value.
+# Those values can be the only ones that open existing data volumes, and losing them silently
+# reverted the graph password to the template default.
+SETUP_OWNED_KEYS='^(_[A-Z0-9_]*|AZURE_OPENAI_[A-Z0-9_]*|AISETTINGS__[A-Z0-9_]*|COPILOT_[A-Z0-9_]*|GITHUB_HOST)$'
+
+restore_unowned_config_keys() {
+    local previous="$1" target="$2"
+    [[ -f "$previous" && -f "$target" ]] || return 0
+
+    local merged="$target.merge.$$"
+    awk -v owned="$SETUP_OWNED_KEYS" '
+        function key_of(line) { return match(line, /^[A-Za-z_][A-Za-z0-9_]*=/) ? substr(line, 1, RLENGTH - 1) : "" }
+        FNR == NR {
+            k = key_of($0)
+            if (k != "" && k !~ owned) { if (!(k in keep)) order[++n] = k; keep[k] = $0 }
+            next
+        }
+        {
+            k = key_of($0)
+            if (k in keep) { if (!(k in done)) print keep[k]; done[k] = 1; next }
+            print
+        }
+        END {
+            header = 0
+            for (i = 1; i <= n; i++) {
+                if (order[i] in done) continue
+                if (!header) { print ""; print "# Kept from the previous configuration"; header = 1 }
+                print keep[order[i]]
+            }
+        }
+    ' "$previous" "$target" > "$merged" && mv "$merged" "$target"
+}
+
+# Determine the preferred dotnet CLI (favor .NET 10 installations when available)
+detect_dotnet_cli() {
+    local default_cli="dotnet"
+    local cli_candidate="$default_cli"
+
+    # Check if default dotnet has .NET 10 runtime
+    if command -v "$default_cli" >/dev/null 2>&1; then
+        if "$default_cli" --list-runtimes 2>/dev/null | grep -q "Microsoft.NETCore.App 10."; then
+            echo "$default_cli"
+            return
+        fi
+    fi
+
+    # Use whatever dotnet is available
+    echo "$cli_candidate"
+}
+
+DOTNET_CMD="$(detect_dotnet_cli)"
+# Accept a Python only if it runs. On Windows, `python`/`python3` on PATH can be the
+# WindowsApps "App execution alias" stub, which prints a Microsoft Store prompt instead of
+# running anything and would silently corrupt every parse that assumes real Python ran.
+verify_python_candidate() {
+    local candidate="$1"
+    command -v "$candidate" >/dev/null 2>&1 || return 1
+    [[ "$("$candidate" -c 'import sys; sys.stdout.write("ok")' 2>/dev/null)" == "ok" ]]
+}
+
+detect_python() {
+    if verify_python_candidate python3; then
+        echo python3
+        return
+    fi
+
+    if verify_python_candidate python; then
+        echo python
+        return
+    fi
+
+    echo ""
+}
+
+PYTHON_CMD="$(detect_python)"
+
+# Windows Python defaults to the ANSI code page for files and pipes, which fails on the
+# non-ASCII text in COBOL comments and in our own output.
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) export PYTHONUTF8=1 ;;
+esac
+
+# The Copilot SDK package downloads its own Copilot CLI from the npm registry on the first
+# build. Where a proxy, firewall or VPN blocks the registry, every build fails with MSB3923
+# before any command runs. An installed Copilot CLI ships the same native binary, and the SDK
+# accepts it through the CopilotCliBinaryPath build property (MSBuild reads it from the
+# environment), so the download is skipped.
+copilot_cli_platform() {
+    local os arch
+    case "$(uname -s)" in
+        Darwin) os=darwin ;;
+        Linux) os=linux ;;
+        MINGW*|MSYS*|CYGWIN*) os=win32 ;;
+        *) return 1 ;;
+    esac
+    case "$(uname -m)" in
+        arm64|aarch64) arch=arm64 ;;
+        x86_64|amd64) arch=x64 ;;
+        *) return 1 ;;
+    esac
+    echo "$os-$arch"
+}
+
+# Follows symlinks without readlink -f, which older macOS lacks.
+resolve_symlinks() {
+    local path="$1" target
+    while [[ -L "$path" ]]; do
+        target="$(readlink "$path")"
+        [[ "$target" == /* ]] || target="$(dirname "$path")/$target"
+        path="$target"
+    done
+    echo "$(cd "$(dirname "$path")" && pwd -P)/$(basename "$path")"
+}
+
+# The native Copilot CLI binary of an installed CLI. npm and Homebrew installs put a Node
+# loader script on PATH; the SDK copies the binary into the build output, so it needs the
+# native executable the loader starts, not the script.
+find_native_copilot_cli() {
+    local platform binary="copilot" cli real npm_root candidate
+    platform="$(copilot_cli_platform)" || return 1
+    [[ "$platform" == win32-* ]] && binary="copilot.exe"
+
+    if cli="$(command -v copilot 2>/dev/null)"; then
+        real="$(resolve_symlinks "$cli")"
+        if [[ -f "$real" && -x "$real" && "$(head -c 2 "$real" 2>/dev/null)" != "#!" ]]; then
+            echo "$real"; return 0
+        fi
+        candidate="$(dirname "$real")/node_modules/@github/copilot-$platform/$binary"
+        [[ -x "$candidate" ]] && { echo "$candidate"; return 0; }
+    fi
+
+    if command -v npm >/dev/null 2>&1 && npm_root="$(npm root -g 2>/dev/null)"; then
+        for candidate in \
+            "$npm_root/@github/copilot/node_modules/@github/copilot-$platform/$binary" \
+            "$npm_root/@github/copilot-$platform/$binary"; do
+            [[ -x "$candidate" ]] && { echo "$candidate"; return 0; }
+        done
+    fi
+    return 1
+}
+
+ensure_copilot_cli_for_build() {
+    [[ -n "${CopilotCliBinaryPath:-}" || "${CopilotSkipCliDownload:-}" == "true" ]] && return 0
+
+    # Each project that builds against the SDK keeps its own downloaded copy.
+    local project missing=false
+    for project in "$REPO_ROOT" "$REPO_ROOT/McpChatWeb"; do
+        compgen -G "$project/obj/*/net*/copilot-cli/*/*/copilot" >/dev/null \
+            || compgen -G "$project/obj/*/net*/copilot-cli/*/*/copilot.exe" >/dev/null \
+            || missing=true
+    done
+    [[ "$missing" == "true" ]] || return 0
+
+    local registry="${CopilotNpmRegistryUrl:-https://registry.npmjs.org}"
+    command -v curl >/dev/null 2>&1 || return 0
+    curl -fsS -o /dev/null -m 8 "${registry%/}/" 2>/dev/null && return 0
+
+    # The SDK never reads npm's own configuration, but a mirror npm is already set up to use
+    # serves the same package, and keeps the CLI version the SDK was built against.
+    local mirror
+    if [[ -z "${CopilotNpmRegistryUrl:-}" ]] && command -v npm >/dev/null 2>&1; then
+        mirror="$(npm config get registry 2>/dev/null)"
+        mirror="${mirror%/}"
+        if [[ "$mirror" == https://* && "$mirror" != "https://registry.npmjs.org" ]] \
+            && curl -fsS -o /dev/null -m 8 "$mirror/" 2>/dev/null; then
+            export CopilotNpmRegistryUrl="$mirror"
+            echo -e "${YELLOW}ℹ️  $registry is not reachable, so the build downloads the Copilot CLI from your npm registry:${NC}"
+            echo -e "${YELLOW}   $mirror${NC}"
+            return 0
+        fi
+    fi
+
+    local native
+    if native="$(find_native_copilot_cli)"; then
+        export CopilotCliBinaryPath="$native"
+        echo -e "${YELLOW}ℹ️  $registry is not reachable, so the build uses your installed Copilot CLI:${NC}"
+        echo -e "${YELLOW}   $native${NC}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}⚠️  $registry is not reachable, and the first build downloads the Copilot CLI from it.${NC}"
+    echo -e "${YELLOW}   The build will fail with MSB3923 unless one of these is done:${NC}"
+    echo -e "${YELLOW}   • allow access to the registry, or set HTTPS_PROXY${NC}"
+    echo -e "${YELLOW}   • install the Copilot CLI (npm install -g @github/copilot) and re-run${NC}"
+    echo -e "${YELLOW}   • export CopilotCliBinaryPath=<path to a native copilot binary>${NC}"
+    echo -e "${YELLOW}   • export CopilotNpmRegistryUrl=<your npm mirror>${NC}"
+    echo -e "${YELLOW}   See docs/building-behind-an-npm-registry-block.md${NC}"
+}
+DEFAULT_MCP_HOST="localhost"
+# MCP_WEB_PORT in Config/ai-config.local.env moves the portal; a shell value still wins at launch.
+DEFAULT_MCP_PORT="$(read_local_config_value MCP_WEB_PORT)"
+DEFAULT_MCP_PORT="${DEFAULT_MCP_PORT:-5028}"
+
+# Function to show usage
+show_usage() {
+    echo -e "${BOLD}${BLUE}🧠 COBOL to Java/C# Migration Tool${NC}"
+    echo -e "${BLUE}==========================================${NC}"
+    echo
+    echo -e "${BOLD}Usage:${NC} $0 [command]"
+    echo
+    echo -e "${BOLD}Available Commands:${NC}"
+    echo -e "  ${GREEN}setup${NC}           Interactive configuration setup"
+    echo -e "  ${GREEN}test${NC}            Full system validation and testing"
+    echo -e "  ${GREEN}run${NC}             Start full migration (auto-detects chunking needs)"
+    echo -e "  ${GREEN}convert-only${NC}    Convert COBOL only (skips RE; prompts to reuse persisted RE context)"
+    echo -e "  ${GREEN}portal${NC}          Start the web portal (documentation & monitoring)"
+    echo -e "  ${GREEN}doctor${NC}          Diagnose configuration issues (default)"
+    echo -e "  ${GREEN}reverse-eng${NC}     Run reverse engineering analysis only (no conversion) + Portal"
+    echo -e "  ${GREEN}resume${NC}          Resume interrupted migration"
+    echo -e "  ${GREEN}monitor${NC}         Monitor migration progress"
+    echo -e "  ${GREEN}chunking-health${NC} Check smart chunking infrastructure"
+    echo -e "  ${GREEN}validate${NC}        Validate system requirements"
+    echo -e "  ${GREEN}conversation${NC}    Generate conversation log from migration data"
+    echo -e "  ${GREEN}programs${NC}        List convertible programs with size, parse fidelity and call counts"
+    echo -e "  ${GREEN}jcl${NC}             Generate jobs from the JCL alone, without a model, and show what each still needs"
+    echo -e "  ${GREEN}estate [C01]${NC}    Cluster the estate into migration waves without a model; with an id, show that slice"
+    echo ""
+    echo -e "${BOLD}Converting a subset:${NC}"
+    echo -e "  ${GREEN}--program NAME${NC}       Convert only this program (repeatable, or comma-separated)"
+    echo -e "  ${GREEN}--job NAME${NC}           Convert the programs this JCL job runs (repeatable, or comma-separated)"
+    echo -e "  ${GREEN}--include-callees${NC}    Also convert everything the selection CALLs"
+    echo -e "  ${GREEN}--language L${NC}         Java or CSharp (skips the interactive prompt)"
+    echo -e "  ${GREEN}--dry-run${NC}            Show what would convert, call no model"
+    echo -e "  ${GREEN}--clean-output${NC}       Clear the target output folder first"
+    echo ""
+    echo -e "  Copybooks are always included; they are never selected directly."
+    echo -e "  A selected name that matches no source file stops the run rather than"
+    echo -e "  quietly converting less than you asked for."
+    echo ""
+    echo -e "  ${CYAN}./doctor.sh programs${NC}"
+    echo -e "  ${CYAN}./doctor.sh run --program PAYRB005.cbl --language Java --dry-run${NC}"
+    echo -e "  ${CYAN}./doctor.sh convert-only --program PAYRB005.cbl --program PAYRB006.cbl${NC}"
+    echo -e "  ${CYAN}./doctor.sh run --program PAYRB005.cbl --include-callees --clean-output${NC}"
+    echo ""
+    echo -e "${BOLD}JCL:${NC}"
+    echo -e "  Jobs are generated from the JCL in every conversion. ${GREEN}--job${NC} converts the programs a job"
+    echo -e "  runs, and what they CALL when the portal is up, so the job can run end to end."
+    echo ""
+    echo -e "  ${CYAN}./doctor.sh jcl --language CSharp${NC}                    jobs only: no model, seconds"
+    echo -e "  ${CYAN}./doctor.sh run --job NITEJ001 --language Java --dry-run${NC}"
+    echo -e "  ${CYAN}./doctor.sh convert-only --job NITEJ001,NITEJ002${NC}"
+    echo
+    echo -e "${BOLD}Cobol-REKT (deterministic static analysis):${NC}"
+    echo -e "  ${GREEN}rekt-parse${NC}      Parse COBOL into ASTs/flowcharts under output/rekt/"
+    echo -e "  ${GREEN}rekt-ingest${NC}     Load parsed artifacts into the REKT Neo4j graph"
+    echo -e "  ${GREEN}rekt-full${NC}       Run parse then ingest"
+    echo -e "  ${GREEN}rekt-status${NC}     Show REKT container, graph, and export status"
+    echo
+    echo -e "${BOLD}Examples:${NC}"
+    echo -e "  $0                   ${CYAN}# Run configuration doctor${NC}"
+    echo -e "  $0 setup             ${CYAN}# Interactive setup${NC}"
+    echo -e "  $0 test              ${CYAN}# Test configuration and dependencies${NC}"
+    echo -e "  $0 reverse-eng       ${CYAN}# Extract business logic only (no conversion) + Portal${NC}"
+    echo -e "  $0 run               ${CYAN}# Full migration (auto-chunks large files)${NC}"
+    echo -e "  $0 portal            ${CYAN}# Start portal to view docs & reports${NC}"
+    echo -e "  $0 convert-only      ${CYAN}# Conversion only (prompts to reuse cached RE results) + UI${NC}"
+    echo
+    echo -e "${BOLD}Business Logic Persistence (--reuse-re):${NC}"
+  echo -e "  RE results are automatically persisted to the database after each run."
+  echo -e "  ${GREEN}Mode 1${NC} — Full migration (default): RE runs and writes its report; prompts get no RE context."
+  echo -e "  ${GREEN}Mode 2${NC} — ${GREEN}--skip-reverse-engineering${NC}: Pure conversion, no RE context."
+  echo -e "  ${GREEN}Mode 3${NC} — ${GREEN}--reuse-re${NC}: Injects RE business logic into conversion prompts: the run's own"
+  echo -e "          in a full run, or the latest saved run over the same source with --skip-reverse-engineering."
+  echo -e "          Off by default: on Bank-of-Z it made converters follow the summary and drop COBOL paths."
+  echo -e "  The ${GREEN}convert-only${NC} command prompts interactively for the --reuse-re choice."
+  echo -e "  To view or delete persisted RE results, open the Portal → 🔬 RE Results button."
+  echo
+  echo -e "${BOLD}Smart Chunking (v0.2):${NC}"
+    echo -e "  Large files (>150K chars or >3000 lines) are automatically"
+    echo -e "  routed through SmartMigrationOrchestrator for optimal processing."
+    echo -e "  - Full Migration: Uses ChunkedMigrationProcess for conversion"
+    echo -e "  - RE-Only Mode: Uses ChunkedReverseEngineeringProcess for analysis"
+    echo -e "  No manual chunking flags required - detection is automatic."
+    echo
+  echo -e "${BOLD}Conversion Parity (preview):${NC}"
+  echo -e "  After conversion, generated code is checked for structural coverage of the"
+  echo -e "  COBOL it came from. Results go to output/<target>/conversion-parity.json"
+  echo -e "  and the migration report. Parity never alters generated output."
+  echo -e "  ${GREEN}MIN_PROGRAM_SCORE${NC}=0.75   Flag programs scoring below this (0 still flags lost axes)"
+  echo -e "  ${GREEN}ON_LOW_SCORE${NC}=warn       'stop' also sets exit code 4"
+  echo -e "  $0 run               ${CYAN}# default: flag below 0.75, warn only${NC}"
+  echo -e "  MIN_PROGRAM_SCORE=0.8 ON_LOW_SCORE=stop $0 run   ${CYAN}# fail CI on a low score${NC}"
+  echo
+}
+
+# Resolve the migration database path (absolute) from config or environment
+get_migration_db_path() {
+    local base_dir="$REPO_ROOT"
+
+    if [[ -n "$MIGRATION_DB_PATH" ]]; then
+        if [[ -z "$PYTHON_CMD" ]]; then
+            echo "$MIGRATION_DB_PATH"
+            return
+        fi
+
+        PY_BASE="$base_dir" PY_DB_PATH="$MIGRATION_DB_PATH" "$PYTHON_CMD" - <<'PY'
+import os
+base = os.environ["PY_BASE"]
+path = os.environ["PY_DB_PATH"]
+if not os.path.isabs(path):
+    path = os.path.abspath(os.path.join(base, path))
+else:
+    path = os.path.abspath(path)
+print(path)
+PY
+        return
+    fi
+
+    if [[ -z "$PYTHON_CMD" ]]; then
+        if [[ -f "$base_dir/Data/migration.db" ]]; then
+            echo "$base_dir/Data/migration.db"
+        else
+            echo ""
+        fi
+        return
+    fi
+
+    PY_BASE="$base_dir" "$PYTHON_CMD" - <<'PY'
+import json
+import os
+
+base = os.environ["PY_BASE"]
+config_path = os.path.join(base, "Config", "appsettings.json")
+fallback = "Data/migration.db"
+try:
+    with open(config_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+        path = data.get("ApplicationSettings", {}).get("MigrationDatabasePath") or fallback
+except FileNotFoundError:
+    path = fallback
+
+if not os.path.isabs(path):
+    path = os.path.abspath(os.path.join(base, path))
+else:
+    path = os.path.abspath(path)
+
+print(path)
+PY
+}
+
+# Fetch the latest migration run summary from SQLite (if available)
+get_latest_run_summary() {
+    local db_path="$1"
+    if [[ -z "$db_path" || ! -f "$db_path" ]]; then
+        return 1
+    fi
+
+    if [[ -z "$PYTHON_CMD" ]]; then
+        return 1
+    fi
+
+    PY_DB_PATH="$db_path" "$PYTHON_CMD" - <<'PY'
+import os
+import sqlite3
+
+db_path = os.environ["PY_DB_PATH"]
+if not os.path.exists(db_path):
+    raise SystemExit
+
+query = """
+SELECT id, status, coalesce(completed_at, started_at)
+FROM runs
+ORDER BY started_at DESC
+LIMIT 1
+"""
+
+with sqlite3.connect(db_path) as conn:
+    row = conn.execute(query).fetchone()
+
+if row:
+    run_id, status, completed_at = row
+    completed_at = completed_at or ""
+    print(f"{run_id}|{status}|{completed_at}")
+PY
+}
+
+open_url_in_browser() {
+    local url="$1"
+    local auto_open="${MCP_AUTO_OPEN:-1}"
+    if [[ "$auto_open" != "1" ]]; then
+        return
+    fi
+
+    case "$(uname -s)" in
+        Darwin)
+            if command -v open >/dev/null 2>&1; then
+                open "$url" >/dev/null 2>&1 &
+            fi
+            ;;
+        Linux)
+            if command -v xdg-open >/dev/null 2>&1; then
+                xdg-open "$url" >/dev/null 2>&1 &
+            fi
+            ;;
+        CYGWIN*|MINGW*|MSYS*|Windows_NT)
+            if command -v powershell.exe >/dev/null 2>&1; then
+                powershell.exe -NoProfile -Command "Start-Process '$url'" >/dev/null 2>&1 &
+            elif command -v cmd.exe >/dev/null 2>&1; then
+                cmd.exe //c start "" "$url"
+            fi
+            ;;
+    esac
+}
+
+launch_mcp_web_ui() {
+    local db_path="$1"
+    local host="${MCP_WEB_HOST:-$DEFAULT_MCP_HOST}"
+    local port="${MCP_WEB_PORT:-$DEFAULT_MCP_PORT}"
+    local url="http://$host:$port"
+
+    # Ensure AI env is loaded (chat vs responses) before launching portal/MCP
+    if ! load_configuration || ! load_ai_config; then
+        echo -e "${RED}❌ Failed to load AI configuration. Portal launch aborted.${NC}"
+        return 1
+    fi
+
+    echo ""
+    echo -e "${BLUE}🌐 Launching MCP Web UI...${NC}"
+    echo "================================"
+    echo -e "Using database: ${BOLD}$db_path${NC}"
+
+    if summary=$(get_latest_run_summary "$db_path" 2>/dev/null); then
+        IFS='|' read -r run_id status completed_at <<<"$summary"
+        echo -e "Latest migration run: ${GREEN}#${run_id}${NC} (${status})"
+        if [[ -n "$completed_at" ]]; then
+            echo -e "Completed at: $completed_at"
+        fi
+        echo ""
+    fi
+
+    echo -e "${BLUE}➡️  Starting web server at${NC} ${BOLD}$url${NC}"
+    
+    # Check if port is already in use and clean up (only kill the LISTEN socket owner)
+    if [[ -n "$(port_listen_pids "$port")" ]]; then
+        echo -e "${YELLOW}⚠️  Port $port is already in use. Cleaning up...${NC}"
+        kill_port_listeners "$port" && echo -e "${GREEN}✅ Killed existing process on port $port${NC}" || true
+        sleep 1
+    fi
+    
+    echo -e "${BLUE}➡️  Press Ctrl+C to stop the UI and exit.${NC}"
+
+    open_url_in_browser "$url"
+
+    export MIGRATION_DB_PATH="$db_path"
+    ASPNETCORE_URLS="$url" ASPNETCORE_HTTP_PORTS="$port" "$DOTNET_CMD" run --project "$REPO_ROOT/McpChatWeb"
+}
+
+# Function to launch portal in background for monitoring during migration
+launch_portal_background() {
+    local db_path="${1:-$REPO_ROOT/Data/migration.db}"
+    local host="${MCP_WEB_HOST:-$DEFAULT_MCP_HOST}"
+    local port="${MCP_WEB_PORT:-$DEFAULT_MCP_PORT}"
+    local url="http://$host:$port"
+
+    echo ""
+    echo -e "${BLUE}🌐 Launching Portal in Background for Monitoring...${NC}"
+    echo "===================================================="
+    
+    # Check if port is already in use and clean up (only kill the LISTEN socket owner)
+    if [[ -n "$(port_listen_pids "$port")" ]]; then
+        echo -e "${YELLOW}⚠️  Port $port is already in use. Cleaning up...${NC}"
+        kill_port_listeners "$port" && echo -e "${GREEN}✅ Killed existing process on port $port${NC}" || true
+        sleep 1
+    fi
+
+    # Launch portal in background
+    export MIGRATION_DB_PATH="$db_path"
+    ASPNETCORE_URLS="$url" ASPNETCORE_HTTP_PORTS="$port" "$DOTNET_CMD" run --project "$REPO_ROOT/McpChatWeb" > "$REPO_ROOT/Logs/portal.log" 2>&1 &
+    PORTAL_PID=$!
+    
+    # Wait for portal to start
+    echo -e "${BLUE}⏳ Waiting for portal to start...${NC}"
+    local max_wait=15
+    local waited=0
+    while [[ -z "$(port_listen_pids "$port")" ]]; do
+        sleep 1
+        waited=$((waited + 1))
+        if [[ $waited -ge $max_wait ]]; then
+            echo -e "${YELLOW}⚠️  Portal may not have started yet, continuing...${NC}"
+            break
+        fi
+    done
+    
+    if [[ -n "$(port_listen_pids "$port")" ]]; then
+        echo -e "${GREEN}✅ Portal running at ${BOLD}$url${NC} (PID: $PORTAL_PID)"
+        open_url_in_browser "$url"
+    fi
+    
+    echo -e "${CYAN}📊 Monitor migration progress in portal: $url${NC}"
+    echo -e "${CYAN}📄 Click 'Migration Monitor' button to see real-time progress${NC}"
+    echo ""
+}
+
+# Function to stop background portal
+stop_portal_background() {
+    if [[ -n "$PORTAL_PID" ]] && kill -0 "$PORTAL_PID" 2>/dev/null; then
+        echo -e "${BLUE}🛑 Stopping background portal (PID: $PORTAL_PID)...${NC}"
+        kill "$PORTAL_PID" 2>/dev/null
+        wait "$PORTAL_PID" 2>/dev/null
+        echo -e "${GREEN}✅ Portal stopped${NC}"
+    fi
+}
+
+# Function to run portal standalone
+run_portal() {
+    echo -e "${BLUE}🌐 Starting Migration Portal${NC}"
+    echo "============================="
+    echo ""
+    echo "The portal provides:"
+    echo "  • 📊 Migration monitoring and progress"
+    echo "  • 📄 Architecture documentation with Mermaid diagrams"
+    echo "  • 📋 Reverse engineering reports with business logic"
+    echo "  • 🔄 Real-time agent chat and chunk status"
+    echo ""
+    
+    local db_path
+    if ! db_path="$(get_migration_db_path)" || [[ -z "$db_path" ]]; then
+        db_path="$REPO_ROOT/Data/migration.db"
+        echo -e "${YELLOW}ℹ️  Using default database path: $db_path${NC}"
+    fi
+    
+    # Check for generated RE report
+    if [[ -f "$REPO_ROOT/output/reverse-engineering-details.md" ]]; then
+        echo -e "${GREEN}✅ Reverse engineering report available in portal${NC}"
+    else
+        echo -e "${YELLOW}ℹ️  No RE report yet - run './doctor.sh reverse-eng' first${NC}"
+    fi
+    echo ""
+    
+    launch_mcp_web_ui "$db_path"
+}
+
+# Function to load configuration
+load_configuration() {
+    if [[ -f "$REPO_ROOT/Config/load-config.sh" ]]; then
+        source "$REPO_ROOT/Config/load-config.sh"
+        local config_status=$?
+        if [[ $config_status -ne 0 ]]; then
+            return $config_status
+        fi
+
+        if [[ -z "${NEO4J_PASSWORD:-}" && -f "$REPO_ROOT/Config/ai-config.local.env" ]]; then
+            local neo4j_line
+            neo4j_line=$(grep -E '^NEO4J_PASSWORD=' "$REPO_ROOT/Config/ai-config.local.env" | tail -1)
+            if [[ -n "$neo4j_line" ]]; then
+                export NEO4J_PASSWORD="${neo4j_line#NEO4J_PASSWORD=}"
+                NEO4J_PASSWORD="${NEO4J_PASSWORD%\"}"
+                NEO4J_PASSWORD="${NEO4J_PASSWORD#\"}"
+                NEO4J_PASSWORD="${NEO4J_PASSWORD%\'}"
+                NEO4J_PASSWORD="${NEO4J_PASSWORD#\'}"
+                export NEO4J_PASSWORD
+            fi
+        fi
+
+        if [[ -n "${NEO4J_PASSWORD:-}" ]]; then
+            export ApplicationSettings__Neo4j__Password="$NEO4J_PASSWORD"
+        fi
+        return 0
+    else
+        echo -e "${RED}❌ Configuration loader not found: Config/load-config.sh${NC}"
+        return 1
+    fi
+}
+
+# Verify that configured model deployments exist on the Azure OpenAI resource
+check_model_deployments() {
+    echo ""
+    echo -e "${BLUE}🤖 Verifying Model Deployments${NC}"
+    echo "================================="
+
+    local endpoint="${AZURE_OPENAI_ENDPOINT}"
+    local api_key="${AZURE_OPENAI_API_KEY}"
+    local has_api_key=false
+    local token=""
+
+    # Determine auth method
+    if [[ -n "$api_key" ]] && [[ "$api_key" != *"your-"* ]] && [[ "$api_key" != *"placeholder"* ]] && [[ "$api_key" != *"key-placeholder"* ]]; then
+        has_api_key=true
+    fi
+
+    if [[ "$has_api_key" == false ]]; then
+        if command -v az >/dev/null 2>&1 && az account show >/dev/null 2>&1; then
+            token=$(az account get-access-token --resource "https://cognitiveservices.azure.com" --query "accessToken" -o tsv 2>/dev/null)
+            if [[ -z "$token" ]]; then
+                echo -e "  ${YELLOW}⚠️  Could not obtain Azure AD token, skipping deployment check${NC}"
+                return 0
+            fi
+        else
+            echo -e "  ${YELLOW}⚠️  No auth available, skipping deployment check${NC}"
+            return 0
+        fi
+    fi
+
+    # Collect unique deployment names and their roles
+    local code_deploy="${AISETTINGS__DEPLOYMENTNAME}"
+    local chat_deploy="${AISETTINGS__CHATDEPLOYMENTNAME}"
+
+    # Build parallel arrays (bash 3 compatible, no associative arrays)
+    local deploy_names=""
+    local deploy_roles=""
+
+    if [[ -n "$code_deploy" ]]; then
+        deploy_names="$code_deploy"
+        deploy_roles="code model (migration agents)"
+    fi
+    if [[ -n "$chat_deploy" ]] && [[ "$chat_deploy" != "$code_deploy" ]]; then
+        deploy_names="${deploy_names}|${chat_deploy}"
+        deploy_roles="${deploy_roles}|chat model (portal & reports)"
+    elif [[ -n "$chat_deploy" ]] && [[ -n "$deploy_roles" ]]; then
+        deploy_roles="${deploy_roles} + chat model"
+    fi
+
+    if [[ -z "$deploy_names" ]]; then
+        echo -e "  ${YELLOW}⚠️  No deployment names configured, skipping check${NC}"
+        return 0
+    fi
+
+    local all_ok=true
+    local api_version="2024-06-01"
+    local idx=0
+
+    IFS='|' read -ra _deploy_arr <<< "$deploy_names"
+    IFS='|' read -ra _role_arr <<< "$deploy_roles"
+
+    for deploy_name in "${_deploy_arr[@]}"; do
+        local role="${_role_arr[$idx]}"
+        idx=$((idx + 1))
+
+        # Use a lightweight inference probe: POST a minimal (invalid) chat completion.
+        # This only needs inference-level RBAC permissions.
+        # Expected: 400 = deployment exists, 404 = not found, 200 = also exists.
+        local test_url="${endpoint%/}/openai/deployments/${deploy_name}/chat/completions?api-version=${api_version}"
+        local tmp_resp
+        tmp_resp=$(mktemp)
+        local curl_args=("-s" "-o" "$tmp_resp" "-w" "%{http_code}" "--connect-timeout" "10" "--max-time" "15")
+        local http_status=""
+        local post_body='{"messages":[],"max_tokens":1}'
+
+        if [[ "$has_api_key" == true ]]; then
+            http_status=$(curl "${curl_args[@]}" -X POST -H "api-key: $api_key" -H "Content-Type: application/json" -d "$post_body" "$test_url" 2>/dev/null)
+        else
+            http_status=$(curl "${curl_args[@]}" -X POST -H "Authorization: Bearer $token" -H "Content-Type: application/json" -d "$post_body" "$test_url" 2>/dev/null)
+        fi
+
+        local body
+        body=$(cat "$tmp_resp" 2>/dev/null)
+        rm -f "$tmp_resp"
+
+        # 400 = deployment exists but our dummy request is invalid (expected)
+        # 200 = deployment exists and responded
+        # 404 = deployment truly not found
+        if [[ "$http_status" == "200" ]] || [[ "$http_status" == "400" ]]; then
+            echo -e "  ${GREEN}✅ Deployment '${deploy_name}' exists${NC} (${role})"
+        elif [[ "$http_status" == "404" ]]; then
+            # Check error code to distinguish "deployment not found" from "endpoint not found"
+            local error_code=""
+            if command -v jq >/dev/null 2>&1; then
+                error_code=$(echo "$body" | jq -r '(.error.code // empty)' 2>/dev/null)
+            fi
+            if [[ "$error_code" == "DeploymentNotFound" ]]; then
+                echo -e "  ${RED}❌ Deployment '${deploy_name}' NOT FOUND${NC} (${role})"
+                echo -e "     ${YELLOW}Create this deployment in the Azure portal or update the name in Config/ai-config.local.env${NC}"
+                all_ok=false
+            else
+                echo -e "  ${RED}❌ Deployment '${deploy_name}' NOT FOUND (HTTP 404)${NC} (${role})"
+                echo -e "     ${YELLOW}Create this deployment in the Azure portal or update the name in Config/ai-config.local.env${NC}"
+                all_ok=false
+            fi
+        elif [[ "$http_status" == "429" ]]; then
+            echo -e "  ${GREEN}✅ Deployment '${deploy_name}' exists${NC} (${role}) ${YELLOW}(rate limited)${NC}"
+        else
+            local error_msg=""
+            if command -v jq >/dev/null 2>&1; then
+                error_msg=$(echo "$body" | jq -r '(.error.message // .error.code // empty)' 2>/dev/null)
+            fi
+            echo -e "  ${YELLOW}⚠️  Deployment '${deploy_name}' check returned HTTP ${http_status}${NC} (${role})"
+            if [[ -n "$error_msg" ]]; then
+                echo -e "     ${YELLOW}Error: $error_msg${NC}"
+            fi
+        fi
+    done
+
+    echo ""
+    if [[ "$all_ok" == false ]]; then
+        echo -e "  ${RED}❌ One or more model deployments are missing.${NC}"
+        echo -e "  ${YELLOW}Fix: Verify deployment names in Config/ai-config.local.env match your Azure OpenAI resource.${NC}"
+        return 1
+    fi
+
+    return 0
+}
+
+# Pre-check: verify AI connectivity via API key or Azure AD (Entra ID) auth
+check_ai_connectivity() {
+    echo ""
+    echo -e "${BLUE}🔌 Pre-Check: AI Service Connectivity${NC}"
+    echo "======================================="
+
+    # GitHub Copilot SDK uses the Copilot CLI, not Azure endpoints
+    if [[ "${AZURE_OPENAI_SERVICE_TYPE}" == "GitHubCopilot" ]]; then
+        echo -e "  Provider: ${GREEN}GitHub Copilot SDK${NC}"
+        if command -v copilot >/dev/null 2>&1; then
+            echo -e "  Copilot CLI: ${GREEN}✅ found${NC}"
+        else
+            echo -e "  Copilot CLI: ${RED}❌ not found in PATH${NC}"
+            return 1
+        fi
+        echo -e "  Model: ${GREEN}${AISETTINGS__MODELID:-not set}${NC}"
+        echo ""
+        return 0
+    fi
+
+    local endpoint="${AZURE_OPENAI_ENDPOINT}"
+    local api_key="${AZURE_OPENAI_API_KEY}"
+    local deployment="${AZURE_OPENAI_DEPLOYMENT_NAME}"
+
+    # Determine authentication method
+    local auth_method=""
+    local has_api_key=false
+    local has_azure_ad=false
+
+    # Check for valid API key
+    if [[ -n "$api_key" ]] && [[ "$api_key" != *"your-"* ]] && [[ "$api_key" != *"placeholder"* ]] && [[ "$api_key" != *"key-placeholder"* ]]; then
+        has_api_key=true
+        auth_method="API Key"
+    fi
+
+    # Check for Azure AD / Entra ID login
+    if command -v az >/dev/null 2>&1; then
+        if az account show >/dev/null 2>&1; then
+            has_azure_ad=true
+            local az_account
+            az_account=$(az account show --query "{name:name, user:user.name}" -o tsv 2>/dev/null)
+            if [[ "$has_api_key" == true ]]; then
+                auth_method="API Key (Azure AD also available)"
+            else
+                auth_method="Azure AD (Entra ID)"
+            fi
+        fi
+    fi
+
+    # Fail if neither auth method is available
+    if [[ "$has_api_key" == false ]] && [[ "$has_azure_ad" == false ]]; then
+        echo -e "${RED}❌ No valid authentication found!${NC}"
+        echo ""
+        echo "  You must configure one of the following:"
+        echo "    1) Set a valid API key in Config/ai-config.local.env"
+        echo "    2) Log in via Azure CLI: az login"
+        echo ""
+        echo "  For API key setup:  ./doctor.sh setup"
+        echo "  For Azure AD setup: az login && ./doctor.sh run"
+        return 1
+    fi
+
+    echo -e "  Auth method: ${GREEN}$auth_method${NC}"
+    if [[ "$has_azure_ad" == true ]]; then
+        local az_user
+        az_user=$(az account show --query "user.name" -o tsv 2>/dev/null)
+        local az_sub
+        az_sub=$(az account show --query "name" -o tsv 2>/dev/null)
+        echo -e "  Azure account: ${GREEN}$az_user${NC} (${az_sub})"
+    fi
+
+    # Connection check: attempt a lightweight request to the endpoint
+    if [[ -z "$endpoint" ]] || [[ "$endpoint" == *"your-"* ]]; then
+        echo -e "${RED}❌ Endpoint not configured. Update AZURE_OPENAI_ENDPOINT in Config/ai-config.local.env${NC}"
+        return 1
+    fi
+
+    echo -e "  Endpoint: ${GREEN}$endpoint${NC}"
+    echo -ne "  Connection: "
+
+    # Build the test URL — try to reach the endpoint root or models list
+    local test_url="${endpoint%/}/openai/models?api-version=2024-06-01"
+    local http_status=""
+    local response_body=""
+    local tmp_response
+    tmp_response=$(mktemp)
+    local curl_args=("-s" "-o" "$tmp_response" "-w" "%{http_code}" "--connect-timeout" "10" "--max-time" "15")
+
+    if [[ "$has_api_key" == true ]]; then
+        http_status=$(curl "${curl_args[@]}" -H "api-key: $api_key" "$test_url" 2>/dev/null)
+    elif [[ "$has_azure_ad" == true ]]; then
+        local token
+        token=$(az account get-access-token --resource "https://cognitiveservices.azure.com" --query "accessToken" -o tsv 2>/dev/null)
+        if [[ -n "$token" ]]; then
+            http_status=$(curl "${curl_args[@]}" -H "Authorization: Bearer $token" "$test_url" 2>/dev/null)
+        else
+            rm -f "$tmp_response"
+            echo -e "${YELLOW}⚠️  Could not obtain Azure AD token for Cognitive Services${NC}"
+            echo -e "  ${YELLOW}Try: az login --scope https://cognitiveservices.azure.com/.default${NC}"
+            return 1
+        fi
+    fi
+
+    response_body=$(cat "$tmp_response" 2>/dev/null)
+    rm -f "$tmp_response"
+
+    # Extract a human-readable error message from the JSON response (if any)
+    local error_msg=""
+    if [[ -n "$response_body" ]]; then
+        # Try jq first, fall back to grep/sed
+        if command -v jq >/dev/null 2>&1; then
+            error_msg=$(echo "$response_body" | jq -r '(.error.message // .error.code // .message // empty)' 2>/dev/null)
+        fi
+        if [[ -z "$error_msg" ]]; then
+            error_msg=$(echo "$response_body" | grep -o '"message":"[^"]*"' | head -1 | sed 's/"message":"//;s/"$//')
+        fi
+    fi
+
+    if [[ -z "$http_status" ]] || [[ "$http_status" == "000" ]]; then
+        echo -e "${RED}❌ FAILED (could not reach endpoint)${NC}"
+        echo -e "  ${YELLOW}Check that the endpoint URL is correct and accessible from this network.${NC}"
+        return 1
+    elif [[ "$http_status" == "200" ]]; then
+        echo -e "${GREEN}✅ OK (HTTP $http_status)${NC}"
+    elif [[ "$http_status" == "401" ]] || [[ "$http_status" == "403" ]]; then
+        echo -e "${RED}❌ FAILED (HTTP $http_status - authentication rejected)${NC}"
+        if [[ -n "$error_msg" ]]; then
+            echo -e "  ${YELLOW}Error: $error_msg${NC}"
+        elif [[ -n "$response_body" ]]; then
+            echo -e "  ${YELLOW}Response: $response_body${NC}"
+        fi
+        if [[ "$has_api_key" == true ]]; then
+            echo -e "  ${YELLOW}Your API key may be invalid or expired. Update Config/ai-config.local.env.${NC}"
+        else
+            echo -e "  ${YELLOW}Your Azure AD token lacks permissions. Check RBAC role assignments.${NC}"
+        fi
+        return 1
+    elif [[ "$http_status" == "404" ]]; then
+        # 404 on models endpoint is acceptable — the endpoint is reachable
+        echo -e "${GREEN}✅ OK (endpoint reachable, HTTP $http_status on models list)${NC}"
+    else
+        # Other status codes (e.g. 400, 429, 500) — endpoint is reachable but request failed
+        echo -e "${RED}❌ FAILED (HTTP $http_status)${NC}"
+        if [[ -n "$error_msg" ]]; then
+            echo -e "  ${YELLOW}Error: $error_msg${NC}"
+        elif [[ -n "$response_body" ]]; then
+            echo -e "  ${YELLOW}Response: $response_body${NC}"
+        fi
+        return 1
+    fi
+
+    echo ""
+
+    # Verify model deployments exist
+    if ! check_model_deployments; then
+        return 1
+    fi
+
+    return 0
+}
+
+# Function for configuration doctor (original functionality)
+run_doctor() {
+    echo -e "${BLUE}🏥 Configuration Doctor - COBOL Migration Tool${NC}"
+    echo "=============================================="
+    echo
+
+    # Check if configuration files exist
+    echo -e "${BLUE}📋 Checking Configuration Files...${NC}"
+    echo
+
+    config_files_ok=true
+
+    # Check the example that local config is created from
+    if [[ -f "$REPO_ROOT/Config/ai-config.env.example" ]]; then
+        echo -e "${GREEN}✅ Example configuration found: Config/ai-config.env.example${NC}"
+    else
+        echo -e "${RED}❌ Missing example configuration: Config/ai-config.env.example${NC}"
+        config_files_ok=false
+    fi
+
+    # Check local configuration
+    if [[ -f "$REPO_ROOT/Config/ai-config.local.env" ]]; then
+        echo -e "${GREEN}✅ Local configuration found: Config/ai-config.local.env${NC}"
+        local_config_exists=true
+    else
+        echo -e "${YELLOW}⚠️  Missing local configuration: Config/ai-config.local.env${NC}"
+        local_config_exists=false
+    fi
+
+    # Check configuration loader
+    if [[ -f "$REPO_ROOT/Config/load-config.sh" ]]; then
+        echo -e "${GREEN}✅ Configuration loader found: Config/load-config.sh${NC}"
+    else
+        echo -e "${RED}❌ Missing configuration loader: Config/load-config.sh${NC}"
+        config_files_ok=false
+    fi
+
+    # Check appsettings.json
+    if [[ -f "$REPO_ROOT/Config/appsettings.json" ]]; then
+        echo -e "${GREEN}✅ Application settings found: Config/appsettings.json${NC}"
+    else
+        echo -e "${RED}❌ Missing application settings: Config/appsettings.json${NC}"
+        config_files_ok=false
+    fi
+
+    echo
+
+    # Check reverse engineering components
+    echo -e "${BLUE}🔍 Checking Reverse Engineering Components...${NC}"
+    echo
+
+    # Check models
+    if [[ -f "$REPO_ROOT/Models/BusinessLogic.cs" ]]; then
+        echo -e "${GREEN}✅ BusinessLogic model found${NC}"
+    else
+        echo -e "${YELLOW}⚠️  Missing BusinessLogic model (optional feature)${NC}"
+    fi
+
+    # Check agents
+    if [[ -f "$REPO_ROOT/Agents/BusinessLogicExtractorAgent.cs" ]]; then
+        echo -e "${GREEN}✅ BusinessLogicExtractorAgent found${NC}"
+    else
+        echo -e "${YELLOW}⚠️  Missing BusinessLogicExtractorAgent (optional feature)${NC}"
+    fi
+
+    # Check process
+    if [[ -f "$REPO_ROOT/Processes/ReverseEngineeringProcess.cs" ]]; then
+        echo -e "${GREEN}✅ ReverseEngineeringProcess found${NC}"
+    else
+        echo -e "${YELLOW}⚠️  Missing ReverseEngineeringProcess (optional feature)${NC}"
+    fi
+
+    # Check documentation
+    if [[ -f "$REPO_ROOT/docs/REVERSE_ENGINEERING_ARCHITECTURE.md" ]]; then
+        echo -e "${GREEN}✅ Reverse engineering architecture documentation found${NC}"
+    else
+        echo -e "${YELLOW}⚠️  Missing reverse engineering architecture documentation${NC}"
+    fi
+
+    # Check for generated RE report
+    if [[ -f "$REPO_ROOT/output/reverse-engineering-details.md" ]]; then
+        echo -e "${GREEN}✅ Generated reverse engineering report found${NC}"
+    else
+        echo -e "${YELLOW}ℹ️  No generated RE report yet (run reverse engineering first)${NC}"
+    fi
+
+    echo
+
+    # If local config doesn't exist, offer to create it
+    if [[ "$local_config_exists" == false ]]; then
+        echo -e "${YELLOW}🔧 Local Configuration Setup${NC}"
+        echo "----------------------------"
+        echo "You need a local configuration file with your AI service credentials."
+        echo
+        read -p "Would you like me to create Config/ai-config.local.env from the template? (y/n): " create_local
+        
+        if [[ "$create_local" =~ ^[Yy]$ ]]; then
+            if [[ -f "$REPO_ROOT/Config/ai-config.env.example" ]]; then
+                cp "$REPO_ROOT/Config/ai-config.env.example" "$REPO_ROOT/Config/ai-config.local.env"
+                echo -e "${GREEN}✅ Created Config/ai-config.local.env from example${NC}"
+                echo -e "${YELLOW}⚠️  You must edit this file with your actual AI service credentials before running the migration tool.${NC}"
+                local_config_exists=true
+            else
+                echo -e "${RED}❌ Example file not found: Config/ai-config.env.example${NC}"
+            fi
+        fi
+        echo
+    fi
+
+    # Load and validate configuration if local config exists
+    if [[ "$local_config_exists" == true ]]; then
+        echo -e "${BLUE}🔍 Validating Configuration Content...${NC}"
+        echo
+        
+        # Source the configuration loader
+        if load_configuration && load_ai_config 2>/dev/null; then
+            
+            # Check required variables
+            config_valid=true
+
+            # Detect provider
+            local service_type="${AZURE_OPENAI_SERVICE_TYPE}"
+            echo -e "${CYAN}Provider:${NC}"
+            if [[ "$service_type" == "GitHubCopilot" ]]; then
+                echo -e "  ${GREEN}✅ GitHub Copilot SDK${NC}"
+
+                # Check copilot CLI
+                if command -v copilot >/dev/null 2>&1; then
+                    echo -e "  ${GREEN}✅ Copilot CLI found in PATH${NC}"
+                else
+                    echo -e "  ${RED}❌ 'copilot' CLI not found in PATH${NC}"
+                    echo -e "  ${YELLOW}   Install: https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli${NC}"
+                    config_valid=false
+                fi
+
+                # Check model IDs
+                echo ""
+                echo -e "${CYAN}Models:${NC}"
+                local model_id="${AISETTINGS__MODELID}"
+                if [[ -n "$model_id" ]]; then
+                    echo -e "  ${GREEN}✅ Code Model: $model_id${NC}"
+                else
+                    echo -e "  ${RED}❌ AISETTINGS__MODELID is not set${NC}"
+                    config_valid=false
+                fi
+
+                local chat_model="${AISETTINGS__CHATMODELID}"
+                if [[ -n "$chat_model" ]]; then
+                    echo -e "  ${GREEN}✅ Chat Model: $chat_model${NC}"
+                else
+                    echo -e "  ${YELLOW}⚠️  AISETTINGS__CHATMODELID not set (will use code model)${NC}"
+                fi
+
+            else
+                echo -e "  ${GREEN}✅ ${service_type:-AzureOpenAI}${NC}"
+
+                # --- Core: Endpoint (required for Azure OpenAI) ---
+                echo ""
+                echo -e "${CYAN}Endpoint:${NC}"
+                endpoint_val="${AZURE_OPENAI_ENDPOINT}"
+                if [[ -z "$endpoint_val" ]]; then
+                    echo -e "  ${RED}❌ AZURE_OPENAI_ENDPOINT is not set${NC}"
+                    config_valid=false
+                elif [[ "$endpoint_val" == *"your-"* ]] || [[ "$endpoint_val" == *"placeholder"* ]]; then
+                    echo -e "  ${YELLOW}⚠️  AZURE_OPENAI_ENDPOINT contains placeholder: $endpoint_val${NC}"
+                    config_valid=false
+                else
+                    echo -e "  ${GREEN}✅ AZURE_OPENAI_ENDPOINT: $endpoint_val${NC}"
+                fi
+                echo
+
+                # --- Authentication ---
+                echo -e "${CYAN}Authentication:${NC}"
+                api_key_val="${AZURE_OPENAI_API_KEY}"
+                if [[ -n "$api_key_val" ]] && [[ "$api_key_val" != *"your-"* ]] && [[ "$api_key_val" != *"placeholder"* ]] && [[ "$api_key_val" != *"key-placeholder"* ]]; then
+                    masked_key="${api_key_val:0:4}...${api_key_val: -4}"
+                    echo -e "  ${GREEN}✅ API Key: $masked_key${NC}"
+                elif command -v az >/dev/null 2>&1 && az account show >/dev/null 2>&1; then
+                    local az_user
+                    az_user=$(az account show --query "user.name" -o tsv 2>/dev/null)
+                    echo -e "  ${GREEN}✅ Azure AD (Entra ID): $az_user${NC}"
+                else
+                    echo -e "  ${RED}❌ No valid auth: set API key in ai-config.local.env or run 'az login'${NC}"
+                    config_valid=false
+                fi
+            fi
+            echo
+
+            # --- Code Model (Responses API - used by migration agents) ---
+            echo -e "${CYAN}Code Model (migration agents):${NC}"
+            code_vars=("AISETTINGS__DEPLOYMENTNAME" "AISETTINGS__MODELID")
+            for var in "${code_vars[@]}"; do
+                value="${!var}"
+                if [[ -z "$value" ]]; then
+                    echo -e "  ${RED}❌ $var is not set${NC}"
+                    config_valid=false
+                elif [[ "$value" == *"your-"* ]] || [[ "$value" == *"placeholder"* ]]; then
+                    echo -e "  ${YELLOW}⚠️  $var contains placeholder: $value${NC}"
+                    config_valid=false
+                else
+                    echo -e "  ${GREEN}✅ $var: $value${NC}"
+                fi
+            done
+            echo
+
+            # --- Chat Model (Chat Completions API - used by portal & reports) ---
+            echo -e "${CYAN}Chat Model (portal & reports):${NC}"
+            chat_vars=("AISETTINGS__CHATDEPLOYMENTNAME" "AISETTINGS__CHATMODELID")
+            for var in "${chat_vars[@]}"; do
+                value="${!var}"
+                if [[ -z "$value" ]]; then
+                    echo -e "  ${YELLOW}⚠️  $var is not set (will fall back to code model)${NC}"
+                else
+                    echo -e "  ${GREEN}✅ $var: $value${NC}"
+                fi
+            done
+
+            # --- Agent-specific model overrides (optional) ---
+            echo
+            echo -e "${CYAN}Agent model overrides (optional):${NC}"
+            agent_vars=("AZURE_OPENAI_COBOL_ANALYZER_MODEL" "AZURE_OPENAI_JAVA_CONVERTER_MODEL" "AZURE_OPENAI_DEPENDENCY_MAPPER_MODEL" "AZURE_OPENAI_UNIT_TEST_MODEL")
+            for var in "${agent_vars[@]}"; do
+                value="${!var}"
+                if [[ -n "$value" ]]; then
+                    echo -e "  ${GREEN}✅ $var: $value${NC}"
+                else
+                    echo -e "  ${BLUE}ℹ️  $var: (defaults to code model)${NC}"
+                fi
+            done
+            
+            echo
+            
+            if [[ "$config_valid" == true ]]; then
+                echo -e "${GREEN}🎉 Configuration validation successful!${NC}"
+                echo
+                echo "Your configuration is ready to use. You can now run:"
+                echo "  ./doctor.sh run"
+                echo "  ./doctor.sh test"
+                echo "  dotnet run"
+            else
+                echo -e "${YELLOW}⚠️  Configuration needs attention${NC}"
+                echo
+                echo "Next steps:"
+                echo "1. Edit Config/ai-config.local.env"
+                echo "2. Replace template placeholders with your actual AI service credentials"
+                echo "3. Run this doctor script again to validate"
+                echo
+                echo "Need help? Run: ./doctor.sh setup"
+            fi
+        else
+            echo -e "${RED}❌ Failed to load configuration${NC}"
+        fi
+    fi
+
+    check_neo4j_graphs || true
+
+    echo
+    echo -e "${BLUE}🔧 Available Commands${NC}"
+    echo "===================="
+    echo "• ./doctor.sh setup         - Interactive configuration setup"
+    echo "• ./doctor.sh test          - Full system validation"
+    echo "• ./doctor.sh run           - Start migration"
+    echo "• ./doctor.sh reverse-eng   - Run reverse engineering only"
+    echo "• ./doctor.sh portal        - Start the web portal"
+    echo ""
+    echo -e "${BLUE}📄 Documentation${NC}"
+    echo "=================="
+    echo "• output/reverse-engineering-details.md - Generated business logic report"
+    echo ""
+    echo -e "${BLUE}🌐 Portal Documentation${NC}"
+    echo "========================"
+    echo "• Start portal: ./doctor.sh portal (or cd McpChatWeb && dotnet run)"
+
+    echo
+    echo -e "${BLUE}💡 Troubleshooting Tips${NC}"
+    echo "======================"
+    echo "• Make sure your AI service endpoint is deployed and accessible"
+    echo "• Verify your model deployment names match your provider setup"
+    echo "• Check that your API key has proper permissions (or Azure AD login is active)"
+    echo "• Ensure your endpoint URL is correct (should end with /)"
+
+    echo
+    echo "Configuration doctor completed!"
+}
+
+# Function to generate migration report
+generate_migration_report() {
+    echo -e "${BLUE}📝 Generating Migration Report...${NC}"
+    
+    if ! resolve_sqlite3; then
+        echo -e "${RED}❌ sqlite3 is not installed. Install it to generate reports.${NC}"
+        echo -e "${YELLOW}   macOS:   brew install sqlite3${NC}"
+        echo -e "${YELLOW}   Linux:   sudo apt install sqlite3${NC}"
+        echo -e "${YELLOW}   Windows: winget install SQLite.SQLite  (then restart your terminal)${NC}"
+        return 1
+    fi
+
+    local db_path="$REPO_ROOT/Data/migration.db"
+    
+    if [ ! -f "$db_path" ]; then
+        echo -e "${RED}❌ Migration database not found at: $db_path${NC}"
+        return 1
+    fi
+    
+    # Get the latest run ID
+    local run_id=$($SQLITE3_CMD "$db_path" "SELECT MAX(run_id) FROM cobol_files;")
+    
+    if [ -z "$run_id" ]; then
+        echo -e "${RED}❌ No migration runs found in database${NC}"
+        return 1
+    fi
+    
+    echo -e "${GREEN}✅ Found run ID: $run_id${NC}"
+    echo "Generating comprehensive report..."
+    
+    local output_dir="$REPO_ROOT/output"
+    local report_file="$output_dir/migration_report_run_${run_id}.md"
+    
+    # Generate the report using SQLite queries
+    {
+        echo "# COBOL Migration Report - Run $run_id"
+        echo ""
+        echo "**Generated:** $(date '+%Y-%m-%d %H:%M:%S')"
+        echo ""
+        echo "---"
+        echo ""
+        
+        echo "## 📊 Migration Summary"
+        echo ""
+        
+        $SQLITE3_CMD "$db_path" <<SQL
+.mode list
+.headers off
+SELECT '- **Total COBOL Files:** ' || COUNT(DISTINCT file_name) FROM cobol_files WHERE run_id = $run_id;
+SELECT '- **Programs (.cbl):** ' || COUNT(DISTINCT file_name) FROM cobol_files WHERE run_id = $run_id AND file_name LIKE '%.cbl';
+SELECT '- **Copybooks (.cpy):** ' || COUNT(DISTINCT file_name) FROM cobol_files WHERE run_id = $run_id AND file_name LIKE '%.cpy';
+SQL
+        
+        echo ""
+        
+        $SQLITE3_CMD "$db_path" <<SQL
+.mode list
+.headers off
+SELECT '- **Total Dependencies:** ' || COUNT(*) FROM dependencies WHERE run_id = $run_id;
+SELECT '  - CALL: ' || COUNT(*) FROM dependencies WHERE run_id = $run_id AND dependency_type = 'CALL';
+SELECT '  - COPY: ' || COUNT(*) FROM dependencies WHERE run_id = $run_id AND dependency_type = 'COPY';
+SELECT '  - PERFORM: ' || COUNT(*) FROM dependencies WHERE run_id = $run_id AND dependency_type = 'PERFORM';
+SELECT '  - EXEC: ' || COUNT(*) FROM dependencies WHERE run_id = $run_id AND dependency_type = 'EXEC';
+SELECT '  - READ: ' || COUNT(*) FROM dependencies WHERE run_id = $run_id AND dependency_type = 'READ';
+SELECT '  - WRITE: ' || COUNT(*) FROM dependencies WHERE run_id = $run_id AND dependency_type = 'WRITE';
+SELECT '  - OPEN: ' || COUNT(*) FROM dependencies WHERE run_id = $run_id AND dependency_type = 'OPEN';
+SELECT '  - CLOSE: ' || COUNT(*) FROM dependencies WHERE run_id = $run_id AND dependency_type = 'CLOSE';
+SQL
+        
+        echo ""
+        echo "---"
+        echo ""
+        
+        echo "## 📁 File Inventory"
+        echo ""
+        
+        $SQLITE3_CMD "$db_path" <<SQL
+.mode markdown
+.headers on
+SELECT file_name AS 'File Name', file_path AS 'Path', is_copybook AS 'Is Copybook'
+FROM cobol_files 
+WHERE run_id = $run_id
+ORDER BY file_name;
+SQL
+        
+        echo ""
+        echo "---"
+        echo ""
+        
+        echo "## 🔗 Dependency Relationships"
+        echo ""
+        
+        $SQLITE3_CMD "$db_path" <<SQL
+.mode markdown
+.headers on
+SELECT source_file AS 'Source', target_file AS 'Target', dependency_type AS 'Type', 
+       COALESCE(line_number, '') AS 'Line', COALESCE(context, '') AS 'Context'
+FROM dependencies 
+WHERE run_id = $run_id
+ORDER BY source_file, dependency_type, target_file;
+SQL
+        
+        echo ""
+        echo "---"
+        echo ""
+        echo "*Report generated by COBOL Migration Tool*"
+        
+    } > "$report_file"
+    
+    echo -e "${GREEN}✅ Report generated successfully!${NC}"
+    echo -e "${CYAN}📄 Location: $report_file${NC}"
+}
+
+# Function for interactive setup
+run_setup() {
+    echo -e "${CYAN}🚀 COBOL to Java Migration Tool - Setup${NC}"
+    echo "========================================"
+    echo ""
+
+    # Check if local config already exists
+    LOCAL_CONFIG="$REPO_ROOT/Config/ai-config.local.env"
+    if [ -f "$LOCAL_CONFIG" ]; then
+        echo -e "${YELLOW}⚠️  Local configuration already exists:${NC} $LOCAL_CONFIG"
+        echo ""
+        read -p "Do you want to overwrite it? (y/N): " -r
+        echo ""
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo -e "${BLUE}ℹ️  Setup cancelled. Your existing configuration is preserved.${NC}"
+            return 0
+        fi
+    fi
+
+    # Create local config from template
+    echo -e "${BLUE}📁 Creating local configuration file...${NC}"
+    TEMPLATE_CONFIG="$REPO_ROOT/Config/ai-config.env.example"
+
+    if [ ! -f "$TEMPLATE_CONFIG" ]; then
+        echo -e "${RED}❌ Example configuration file not found: $TEMPLATE_CONFIG${NC}"
+        return 1
+    fi
+
+    SETUP_PREVIOUS_CONFIG=""
+    if [[ -f "$LOCAL_CONFIG" ]]; then
+        SETUP_PREVIOUS_CONFIG="$(mktemp)"
+        cp "$LOCAL_CONFIG" "$SETUP_PREVIOUS_CONFIG"
+        trap 'rm -f "$SETUP_PREVIOUS_CONFIG"; trap - RETURN' RETURN
+    fi
+
+    cp "$TEMPLATE_CONFIG" "$LOCAL_CONFIG"
+    echo -e "${GREEN}✅ Created: $LOCAL_CONFIG${NC}"
+    echo ""
+
+    # Interactive configuration
+    echo -e "${BLUE}🔧 Interactive Configuration Setup${NC}"
+    echo "=================================="
+    echo ""
+
+    # Provider selection
+    echo "Select your AI provider:"
+    echo -e "  ${GREEN}1)${NC} Azure OpenAI / Azure AI Foundry (default)"
+    echo -e "  ${GREEN}2)${NC} GitHub Copilot SDK (requires Copilot CLI in PATH)"
+    echo ""
+    read -p "Choice [1]: " provider_choice
+    provider_choice=${provider_choice:-1}
+    echo ""
+
+    if [[ "$provider_choice" == "2" ]]; then
+        # --- GitHub Copilot SDK setup ---
+        echo -e "${BLUE}🐙 GitHub Copilot SDK Configuration${NC}"
+        echo ""
+
+        # Verify copilot CLI is available
+        if ! command -v copilot >/dev/null 2>&1; then
+            echo -e "${RED}❌ 'copilot' CLI not found in PATH.${NC}"
+            echo -e "${YELLOW}   Install it: https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli${NC}"
+            return 1
+        fi
+        echo -e "${GREEN}✅ Copilot CLI found in PATH${NC}"
+        echo ""
+
+        # GitHub host selection
+        echo -e "${BOLD}${BLUE}GitHub Host${NC}"
+        echo -e "  ${GREEN}1)${NC} github.com (default)"
+        echo -e "  ${GREEN}2)${NC} GitHub Data Residency (custom host)"
+        echo ""
+        read -p "Choice [1]: " gh_host_choice
+        gh_host_choice=${gh_host_choice:-1}
+        echo ""
+
+        if [[ "$gh_host_choice" == "2" ]]; then
+            read -p "Enter your GitHub host (e.g., github.yourcompany.ghe.com): " custom_gh_host
+            if [[ -n "$custom_gh_host" ]]; then
+                # Strip protocol prefix if provided
+                custom_gh_host="${custom_gh_host#https://}"
+                custom_gh_host="${custom_gh_host#http://}"
+                # Strip trailing slash
+                custom_gh_host="${custom_gh_host%/}"
+                GITHUB_HOST="$custom_gh_host"
+            else
+                echo -e "${YELLOW}⚠️  No host provided, defaulting to github.com${NC}"
+            fi
+        fi
+        echo -e "${GREEN}✅ GitHub host: ${GITHUB_HOST}${NC}"
+        echo ""
+
+        # Check CLI version and update if needed (before auth, to avoid interrupted login)
+        local cli_version
+        cli_version=$(copilot --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        local min_version="0.0.394"
+        if [[ -n "$cli_version" ]]; then
+            echo -e "${BLUE}ℹ️  Copilot CLI version: $cli_version${NC}"
+            # Compare versions: sort -V puts the lower version first
+            local lower
+            lower=$(printf '%s\n%s' "$cli_version" "$min_version" | sort -V | head -1)
+            if [[ "$lower" == "$cli_version" && "$cli_version" != "$min_version" ]]; then
+                echo -e "${YELLOW}⚠️  Version $cli_version is below minimum $min_version. Updating...${NC}"
+                npm install -g @github/copilot@latest 2>&1 | tail -3
+                echo ""
+                echo -e "${GREEN}✅ Copilot CLI updated${NC}"
+            fi
+        fi
+        echo ""
+
+        # Authentication method selection
+        echo -e "${BLUE}🔐 How do you want to authenticate?${NC}"
+        echo -e "  ${GREEN}1)${NC} Copilot CLI sign-in (copilot login) (default)"
+        echo -e "  ${GREEN}2)${NC} Fine-grained personal access token"
+        echo ""
+        read -p "Choice [1]: " auth_choice
+        auth_choice=${auth_choice:-1}
+        echo ""
+
+        local ghcp_token=""
+
+        if [[ "$auth_choice" == "2" ]]; then
+            # --- PAT authentication ---
+            echo -e "${BLUE}🔑 Fine-grained personal access token${NC}"
+            echo ""
+            echo -e "${YELLOW}Create a fine-grained token on your personal account with this permission:${NC}"
+            echo "    • Account permissions → Copilot Requests (read)"
+            echo -e "${YELLOW}Classic tokens (ghp_) do not work with GitHub Copilot.${NC}"
+            echo ""
+            echo -e "${YELLOW}Create one at: https://${GITHUB_HOST}/settings/personal-access-tokens/new${NC}"
+            echo ""
+            # Read from /dev/tty explicitly to ensure correct capture in all terminal environments
+            echo -n "Please provide the token and press Enter: "
+            read -s ghcp_token < /dev/tty
+            echo ""
+            ghcp_token="$(printf '%s' "$ghcp_token" | tr -d '[:space:]')"
+
+            if [[ -z "$ghcp_token" ]]; then
+                echo -e "${RED}❌ No token provided. Aborting.${NC}"
+                return 1
+            fi
+            if [[ "$ghcp_token" == ghp_* ]]; then
+                echo -e "${RED}❌ That is a classic token (ghp_). Copilot needs a fine-grained token (github_pat_) with the 'Copilot Requests' permission.${NC}"
+                return 1
+            fi
+
+            echo -e "${GREEN}✅ PAT received: ${ghcp_token:0:4}...${ghcp_token: -4}${NC}"
+        else
+            # --- CLI authentication (existing flow) ---
+            echo -e "${BLUE}🔐 Authenticating with GitHub Copilot...${NC}"
+            echo ""
+            if ! copilot login --host "https://${GITHUB_HOST}"; then
+                echo ""
+                echo -e "${RED}❌ Authentication failed. Please try again.${NC}"
+                return 1
+            fi
+            echo ""
+            echo -e "${GREEN}✅ Authentication successful!${NC}"
+            local ambient_vars=""
+            [[ -n "${GH_TOKEN:-}" ]] && ambient_vars+=" GH_TOKEN"
+            [[ -n "${GITHUB_TOKEN:-}" ]] && ambient_vars+=" GITHUB_TOKEN"
+            [[ -n "${COPILOT_GITHUB_TOKEN:-}" ]] && ambient_vars+=" COPILOT_GITHUB_TOKEN"
+            if [[ -n "$ambient_vars" ]]; then
+                echo -e "${YELLOW}ℹ️  Your shell sets${ambient_vars}. The Copilot CLI would normally prefer these over 'copilot login';${NC}"
+                echo -e "${YELLOW}   this project sets COPILOT_AUTH=login, so they are ignored for its Copilot calls.${NC}"
+            fi
+        fi
+        echo ""
+        local copilot_auth_mode="login"
+        [[ -n "$ghcp_token" ]] && copilot_auth_mode="token"
+
+        # Get available models from GitHub Copilot (user-specific)
+        echo -e "${BLUE}📋 Fetching available models for your account...${NC}"
+        echo ""
+        local models_raw list_output
+        # Run list-models and extract only "  • model-id" lines
+        list_output=$(COPILOT_AUTH="$copilot_auth_mode" COPILOT_GITHUB_TOKEN="$ghcp_token" \
+            "$DOTNET_CMD" run --project "$REPO_ROOT/CobolToQuarkusMigration.csproj" -- list-models 2>&1)
+        models_raw=$(printf '%s\n' "$list_output" | grep '•' | sed 's/.*•[[:space:]]*//' | awk '!seen[$0]++')
+
+        # Fallback to copilot CLI static list if SDK call fails
+        if [[ -z "$models_raw" ]]; then
+            echo -e "${YELLOW}⚠️  Could not fetch user-specific models, falling back to CLI model list${NC}"
+            local reason
+            reason=$(printf '%s\n' "$list_output" | grep -E 'error|Error|failed|Failed' | grep -v 'warning' | head -3)
+            [[ -n "$reason" ]] && printf '%s\n' "$reason" | cut -c1-240 | sed 's/^/   /'
+            if printf '%s\n' "$list_output" | grep -q 'MSB3923'; then
+                echo -e "${YELLOW}   The build could not download the Copilot CLI. See docs/building-behind-an-npm-registry-block.md.${NC}"
+            fi
+            models_raw=$(copilot --model invalid 2>&1 | grep -o 'Allowed choices are .*' | sed 's/Allowed choices are //' | tr ',' '\n' | sed 's/[[:space:]]*//g' | sed 's/\.$//')
+        fi
+
+        local models=()
+        while IFS= read -r model; do
+            [[ -n "$model" ]] && models+=("$model")
+        done <<< "$models_raw"
+
+        # --- Step 1: Chat Model Selection ---
+        echo -e "${BOLD}${BLUE}Step 1: Chat Model${NC}"
+        echo -e "${CYAN}The chat model handles analysis, reasoning, and conversation tasks —${NC}"
+        echo -e "${CYAN}reverse engineering COBOL logic, extracting business rules, and planning${NC}"
+        echo -e "${CYAN}the migration strategy. A strong reasoning model works best here.${NC}"
+        echo ""
+
+        if [[ ${#models[@]} -gt 0 ]]; then
+            local i=1
+            for m in "${models[@]}"; do
+                echo "  $i) $m"
+                ((i++))
+            done
+            echo ""
+            echo -e "${YELLOW}Note: Model availability depends on your GitHub Copilot plan.${NC}"
+            echo ""
+            read -p "Select chat model [1-${#models[@]}] (default: 1): " chat_choice
+            chat_choice=${chat_choice:-1}
+
+            if [[ "$chat_choice" =~ ^[0-9]+$ ]] && (( chat_choice >= 1 && chat_choice <= ${#models[@]} )); then
+                ghcp_chat_model="${models[$((chat_choice - 1))]}"
+            else
+                echo -e "${RED}Invalid selection, using default: ${models[0]}${NC}"
+                ghcp_chat_model="${models[0]}"
+            fi
+        else
+            read -p "Chat model name (default: claude-sonnet-4): " ghcp_chat_model
+            ghcp_chat_model=${ghcp_chat_model:-claude-sonnet-4}
+        fi
+
+        echo ""
+        echo -e "${GREEN}✅ Chat model: $ghcp_chat_model${NC}"
+        echo ""
+
+        # --- Step 2: Code Model Selection ---
+        echo -e "${BOLD}${BLUE}Step 2: Code Model${NC}"
+        echo -e "${CYAN}The code model generates the actual Java/C# source code from COBOL.${NC}"
+        echo -e "${CYAN}It writes classes, methods, and tests. A model optimized for code${NC}"
+        echo -e "${CYAN}generation can improve output quality and compilation success rates.${NC}"
+        echo ""
+        read -p "Use a different model for code generation? (y/N): " -r
+        echo ""
+
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            echo ""
+            if [[ ${#models[@]} -gt 0 ]]; then
+                local j=1
+                for m in "${models[@]}"; do
+                    echo "  $j) $m"
+                    ((j++))
+                done
+                echo ""
+                read -p "Select code model [1-${#models[@]}] (default: 1): " code_choice
+                code_choice=${code_choice:-1}
+
+                if [[ "$code_choice" =~ ^[0-9]+$ ]] && (( code_choice >= 1 && code_choice <= ${#models[@]} )); then
+                    ghcp_code_model="${models[$((code_choice - 1))]}"
+                else
+                    echo -e "${RED}Invalid selection, using default: ${models[0]}${NC}"
+                    ghcp_code_model="${models[0]}"
+                fi
+            else
+                read -p "Code model name (default: claude-sonnet-4): " ghcp_code_model
+                ghcp_code_model=${ghcp_code_model:-claude-sonnet-4}
+            fi
+        else
+            ghcp_code_model="$ghcp_chat_model"
+            echo -e "${CYAN}⏭️  Skipped — using chat model ${BOLD}$ghcp_chat_model${NC}${CYAN} for code generation too${NC}"
+        fi
+
+        echo ""
+        echo -e "${GREEN}✅ Chat model: $ghcp_chat_model${NC}"
+        echo -e "${GREEN}✅ Code model: $ghcp_code_model${NC}"
+
+        # Preserve anything already configured: these values may be the only ones that open
+        # the existing Neo4j volumes, and setup rewrites this file wholesale.
+        local existing_neo4j existing_source
+        # Read from the snapshot: the live file is already the template at this point.
+        existing_neo4j=$(read_local_config_value NEO4J_PASSWORD "${SETUP_PREVIOUS_CONFIG:-/dev/null}")
+        existing_source=$(read_local_config_value COBOL_SOURCE_FOLDER "${SETUP_PREVIOUS_CONFIG:-/dev/null}")
+
+        local neo4j_password="${existing_neo4j:-cobol-rekt-2026}"
+        local source_folder="${existing_source:-source}"
+
+        if [[ -n "$existing_neo4j" || -n "$existing_source" ]]; then
+            echo -e "${BLUE}  Keeping existing Neo4j and source settings from $(basename "$LOCAL_CONFIG")${NC}"
+        fi
+
+        # Write local config for GitHub Copilot
+        cat > "$LOCAL_CONFIG" <<EOF
+# =============================================================================
+# GitHub Copilot SDK Configuration
+# =============================================================================
+# This configuration uses the GitHub Copilot SDK instead of Azure OpenAI.
+# Auth: COPILOT_AUTH (below) - 'copilot login' or a fine-grained token in COPILOT_GITHUB_TOKEN.
+# =============================================================================
+
+# Provider
+AZURE_OPENAI_SERVICE_TYPE="GitHubCopilot"
+
+# Model Selection
+_CHAT_MODEL="$ghcp_chat_model"
+_CODE_MODEL="$ghcp_code_model"
+
+# System mapping (model IDs for the application)
+# Two naming schemes are required and neither is redundant: the CLI reads AZURE_OPENAI_*
+# explicitly, while the portal is ASP.NET Core and binds AISETTINGS__* automatically. The CLI
+# never calls AddEnvironmentVariables(), so an AISETTINGS__ value alone is invisible to it and
+# the tracked appsettings.json default silently wins instead.
+AZURE_OPENAI_MODEL_ID="\$_CODE_MODEL"
+AZURE_OPENAI_DEPLOYMENT_NAME="\$_CODE_MODEL"
+AZURE_OPENAI_CHAT_MODEL_ID="\$_CHAT_MODEL"
+AZURE_OPENAI_CHAT_DEPLOYMENT_NAME="\$_CHAT_MODEL"
+AISETTINGS__MODELID="\$_CODE_MODEL"
+AISETTINGS__DEPLOYMENTNAME="\$_CODE_MODEL"
+AISETTINGS__CHATMODELID="\$_CHAT_MODEL"
+AISETTINGS__CHATDEPLOYMENTNAME="\$_CHAT_MODEL"
+
+# Not needed for Copilot SDK but set to avoid validation errors
+AZURE_OPENAI_ENDPOINT="https://copilot-sdk-placeholder"
+AISETTINGS__ENDPOINT="https://copilot-sdk-placeholder"
+AISETTINGS__CHATENDPOINT="https://copilot-sdk-placeholder"
+
+# Neo4j local development credentials
+# Username: neo4j
+# NOT FOR PRODUCTION, ENSURE TO CHANGE PASSWORD
+#
+# One instance holds the migration and REKT graphs (default bolt 7687). Neo4j fixes the
+# password in its data volume the first time it starts, so this must match the volume that
+# already exists. Re-running setup keeps whatever is set here.
+NEO4J_PASSWORD="$neo4j_password"
+
+# The parser reads this folder and the portal resolves the estate through it; they must agree.
+COBOL_SOURCE_FOLDER="$source_folder"
+EOF
+
+        # Append GitHub host if not default
+        if [[ "$GITHUB_HOST" != "github.com" ]]; then
+            cat >> "$LOCAL_CONFIG" <<EOF
+
+# GitHub Data Residency host
+GITHUB_HOST="$GITHUB_HOST"
+EOF
+        fi
+
+        cat >> "$LOCAL_CONFIG" <<EOF
+
+# GitHub Copilot authentication: login = 'copilot login' (GH_TOKEN/GITHUB_TOKEN ignored),
+# token = COPILOT_GITHUB_TOKEN below
+COPILOT_AUTH="$copilot_auth_mode"
+EOF
+        if [[ -n "$ghcp_token" ]]; then
+            cat >> "$LOCAL_CONFIG" <<EOF
+# Fine-grained token with the 'Copilot Requests' permission
+COPILOT_GITHUB_TOKEN="$ghcp_token"
+EOF
+        fi
+
+        restore_unowned_config_keys "$SETUP_PREVIOUS_CONFIG" "$LOCAL_CONFIG"
+
+        echo ""
+        echo -e "${GREEN}✅ GitHub Copilot SDK configuration written!${NC}"
+        echo -e "   Config file: ${BLUE}$LOCAL_CONFIG${NC}"
+        echo ""
+        ensure_neo4j_image || return 1
+        ensure_graph_populator_environment || return 1
+        echo ""
+        echo -e "${BLUE}Next steps:${NC}"
+        echo "1. Run: ./doctor.sh test"
+        echo "2. Run: ./doctor.sh run"
+        return 0
+    fi
+
+    # --- Azure OpenAI setup (original flow) ---
+    echo "Please provide your AI service configuration details:"
+    echo ""
+
+    # Get AI Endpoint
+    read -p "AI Endpoint (e.g., https://your-resource.openai.azure.com/): " endpoint
+    if [[ -n "$endpoint" ]]; then
+        # Checked by shape, not by calling it: a request would have to cross the customer's
+        # proxy and TLS inspection, so a blocked call says nothing about whether the value is
+        # right. Warn rather than reject, since only the resource itself knows what it accepts.
+        if [[ "$endpoint" == *"/api/projects/"* ]]; then
+            echo -e "${YELLOW}⚠️  That looks like an AI Foundry project URL.${NC}"
+            echo -e "${YELLOW}   The Azure OpenAI client expects the resource root, and a project${NC}"
+            echo -e "${YELLOW}   path returns 401 on every call.${NC}"
+            local suggested="${endpoint%%/api/projects/*}/"
+            read -p "   Use ${suggested} instead? [Y/n]: " use_root
+            [[ ! "$use_root" =~ ^[Nn]$ ]] && endpoint="$suggested"
+        elif [[ "$endpoint" != https://* ]]; then
+            echo -e "${YELLOW}⚠️  Endpoint does not start with https:// — check it is the full URL.${NC}"
+        fi
+
+        # Ensure endpoint ends with /
+        [[ "${endpoint}" != */ ]] && endpoint="${endpoint}/"
+        sed -i.bak "s|_MAIN_ENDPOINT=\".*\"|_MAIN_ENDPOINT=\"$endpoint\"|" "$LOCAL_CONFIG"
+        echo -e "${GREEN}✅ Endpoint: $endpoint${NC}"
+    fi
+
+    # Get API Key
+    read -s -p "API Key (leave empty for Azure AD/Entra ID auth): " api_key
+    echo ""
+    if [[ -n "$api_key" ]]; then
+        sed -i.bak "s|_MAIN_API_KEY=\".*\"|_MAIN_API_KEY=\"$api_key\"|" "$LOCAL_CONFIG"
+    else
+        # Clear it rather than leaving the previous value in place. The client only falls back
+        # to Entra ID when the key is empty, so a leftover key or the template placeholder is
+        # used as a credential and every call fails with 401 while this message claims otherwise.
+        sed -i.bak "s|_MAIN_API_KEY=\".*\"|_MAIN_API_KEY=\"\"|" "$LOCAL_CONFIG"
+        echo -e "${BLUE}ℹ️  No API key set — will use Azure AD (Entra ID) via 'az login'.${NC}"
+        echo -e "${BLUE}   Make sure you have the 'Cognitive Services OpenAI User' role.${NC}"
+        echo -e "${BLUE}   See: docs/az-login-auth-guide.md for details.${NC}"
+    fi
+
+    # Get Chat Model Deployment Name
+    # Prompted like the code model: it was previously left at whatever the file already held,
+    # so a stale deployment name survived setup and was used without ever being shown.
+    local existing_chat_model
+    existing_chat_model=$(read_local_config_value _CHAT_MODEL "${SETUP_PREVIOUS_CONFIG:-/dev/null}")
+    read -p "Chat Model Deployment Name (default: ${existing_chat_model:-gpt-4o}): " chat_model
+    chat_model=${chat_model:-${existing_chat_model:-gpt-4o}}
+    sed -i.bak "s|_CHAT_MODEL=\".*\"|_CHAT_MODEL=\"$chat_model\"|" "$LOCAL_CONFIG"
+
+    # Get Code Model Deployment Name
+    read -p "Code Model Deployment Name (default: gpt-5.1-codex-mini): " code_model
+    code_model=${code_model:-gpt-5.1-codex-mini}
+    sed -i.bak "s|_CODE_MODEL=\".*\"|_CODE_MODEL=\"$code_model\"|" "$LOCAL_CONFIG"
+
+    # Clean up backup file
+    rm -f "$LOCAL_CONFIG.bak"
+    restore_unowned_config_keys "$SETUP_PREVIOUS_CONFIG" "$LOCAL_CONFIG"
+
+    echo ""
+    echo -e "${GREEN}✅ Configuration completed!${NC}"
+    echo ""
+    ensure_neo4j_image || return 1
+    ensure_graph_populator_environment || return 1
+    echo ""
+    echo -e "${BLUE}🔍 Testing configuration...${NC}"
+    
+    # Test the configuration
+    if load_configuration && load_ai_config 2>/dev/null; then
+        echo -e "${GREEN}✅ Configuration loaded successfully!${NC}"
+        echo ""
+        echo -e "${BLUE}Next steps:${NC}"
+        echo "1. Run: ./doctor.sh test    # Test system dependencies"
+        echo "2. Run: ./doctor.sh run     # Start migration"
+        echo ""
+        echo "Your configuration is ready to use!"
+    else
+        echo -e "${RED}❌ Configuration test failed${NC}"
+        echo "Please check your settings and try again."
+    fi
+}
+
+# Function for comprehensive testing
+run_test() {
+    echo -e "${BOLD}${BLUE}COBOL to Java Quarkus Migration Tool - Test Suite${NC}"
+    echo "=================================================="
+
+    echo -e "${BLUE}Using dotnet CLI:${NC} $DOTNET_CMD"
+
+    # Load configuration
+    echo "🔧 Loading AI configuration..."
+    if ! load_configuration; then
+        echo -e "${RED}❌ Failed to load configuration system${NC}"
+        return 1
+    fi
+
+    echo ""
+    echo "Testing Configuration:"
+    echo "====================="
+
+    if load_ai_config; then
+        echo ""
+        echo -e "${GREEN}✅ Configuration loaded successfully!${NC}"
+        echo ""
+        echo "Configuration Summary:"
+        show_config_summary 2>/dev/null || echo "Configuration details loaded"
+    else
+        echo ""
+        echo -e "${RED}❌ Configuration loading failed!${NC}"
+        echo ""
+        echo "To fix this:"
+        echo "1. Run: ./doctor.sh setup"
+        echo "2. Edit Config/ai-config.local.env with your AI service credentials"
+        echo "3. Run this test again"
+        return 1
+    fi
+
+    # Check .NET version
+    echo ""
+    echo "Checking .NET version..."
+    dotnet_version=$("$DOTNET_CMD" --version 2>/dev/null)
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}✅ .NET version: $dotnet_version${NC}"
+        
+        # Check if it's .NET 10.0 or higher
+        major_version=$(echo $dotnet_version | cut -d. -f1)
+        if [ "$major_version" -ge 10 ]; then
+            echo -e "${GREEN}✅ .NET 10.0+ requirement satisfied${NC}"
+        else
+            echo -e "${YELLOW}⚠️  Warning: .NET 10.0+ recommended (current: $dotnet_version)${NC}"
+        fi
+    else
+        echo -e "${RED}❌ .NET is not installed or not in PATH${NC}"
+        return 1
+    fi
+
+    # Build project
+    echo ""
+    echo "Building project and restoring packages..."
+    echo "="
+    if timeout 30s "$DOTNET_CMD" build "$REPO_ROOT/CobolToQuarkusMigration.csproj" --no-restore --verbosity quiet 2>/dev/null || "$DOTNET_CMD" build "$REPO_ROOT/CobolToQuarkusMigration.csproj" --verbosity minimal; then
+        echo -e "${GREEN}✅ Project builds successfully${NC}"
+    else
+        echo -e "${RED}❌ Project build failed${NC}"
+        echo "Try running: dotnet restore CobolToQuarkusMigration.csproj"
+        return 1
+    fi
+
+    # Check source folders
+    echo ""
+    echo "Checking source folders..."
+    cobol_files=$(find "$REPO_ROOT/source" -name "*.cbl" 2>/dev/null | wc -l)
+    copybook_files=$(find "$REPO_ROOT/source" -name "*.cpy" 2>/dev/null | wc -l)
+    total_files=$((cobol_files + copybook_files))
+    
+    if [ "$total_files" -gt 0 ]; then
+        if [ "$cobol_files" -gt 0 ]; then
+            echo -e "${GREEN}✅ Found $(printf "%8d" $cobol_files) COBOL files in source directory${NC}"
+        fi
+        if [ "$copybook_files" -gt 0 ]; then
+            echo -e "${GREEN}✅ Found $(printf "%8d" $copybook_files) copybooks in source directory${NC}"
+        fi
+    else
+        echo -e "${YELLOW}⚠️  No COBOL files or copybooks found in source directory${NC}"
+        echo "   Add your COBOL files to ./source/ to test migration"
+    fi
+
+    # Check output directories
+    echo ""
+    echo "Checking output directories..."
+    
+    # Check Java output folder
+    if [ -d "$REPO_ROOT/output/java" ]; then
+        java_files=$(find "$REPO_ROOT/output/java" -name "*.java" 2>/dev/null | wc -l)
+        if [ "$java_files" -gt 0 ]; then
+            echo -e "${GREEN}✅ Found previous Java output ($java_files files) in output/java/${NC}"
+        else
+            echo -e "${BLUE}ℹ️  No previous Java output found in output/java/${NC}"
+        fi
+    else
+        echo -e "${BLUE}ℹ️  Java output directory (output/java/) will be created during migration${NC}"
+    fi
+    
+    # Check C# output folder
+    if [ -d "$REPO_ROOT/output/csharp" ]; then
+        csharp_files=$(find "$REPO_ROOT/output/csharp" -name "*.cs" 2>/dev/null | wc -l)
+        if [ "$csharp_files" -gt 0 ]; then
+            echo -e "${GREEN}✅ Found previous C# output ($csharp_files files) in output/csharp/${NC}"
+        else
+            echo -e "${BLUE}ℹ️  No previous C# output found in output/csharp/${NC}"
+        fi
+    else
+        echo -e "${BLUE}ℹ️  C# output directory (output/csharp/) will be created during migration${NC}"
+    fi
+    
+    # Check for reverse engineering output
+    if [ -d "$REPO_ROOT/output" ]; then
+        md_files=$(find "$REPO_ROOT/output" -name "*.md" 2>/dev/null | wc -l)
+        if [ "$md_files" -gt 0 ]; then
+            echo -e "${GREEN}✅ Found previous reverse engineering output ($md_files markdown files)${NC}"
+        else
+            echo -e "${BLUE}ℹ️  No previous reverse engineering output found${NC}"
+        fi
+    fi
+
+    # Check logging infrastructure
+    echo ""
+    echo "Checking logging infrastructure..."
+    if [ -d "$REPO_ROOT/Logs" ]; then
+        log_files=$(find "$REPO_ROOT/Logs" -name "*.log" 2>/dev/null | wc -l)
+        echo -e "${GREEN}✅ Log directory exists with $(printf "%8d" $log_files) log files${NC}"
+    else
+    mkdir -p "$REPO_ROOT/Logs"
+        echo -e "${GREEN}✅ Created Logs directory${NC}"
+    fi
+
+    # Check for reverse engineering agents and models
+    echo ""
+    echo "Checking reverse engineering components..."
+    re_components=0
+    re_components_total=3
+    
+    [ -f "$REPO_ROOT/Models/BusinessLogic.cs" ] && ((re_components++))
+    [ -f "$REPO_ROOT/Agents/BusinessLogicExtractorAgent.cs" ] && ((re_components++))
+    [ -f "$REPO_ROOT/Processes/ReverseEngineeringProcess.cs" ] && ((re_components++))
+    
+    if [ $re_components -eq $re_components_total ]; then
+        echo -e "${GREEN}✅ All reverse engineering components present ($re_components/$re_components_total)${NC}"
+    elif [ $re_components -gt 0 ]; then
+        echo -e "${YELLOW}⚠️  Partial reverse engineering support ($re_components/$re_components_total components)${NC}"
+    else
+        echo -e "${BLUE}ℹ️  Reverse engineering feature not installed${NC}"
+    fi
+    
+    # Check for smart chunking infrastructure (v0.2)
+    echo ""
+    echo "Checking smart chunking infrastructure (v0.2)..."
+    chunking_components=0
+    chunking_total=3
+    
+    [ -f "$REPO_ROOT/Processes/SmartMigrationOrchestrator.cs" ] && ((chunking_components++))
+    [ -f "$REPO_ROOT/Processes/ChunkedMigrationProcess.cs" ] && ((chunking_components++))
+    [ -f "$REPO_ROOT/Processes/ChunkedReverseEngineeringProcess.cs" ] && ((chunking_components++))
+    
+    if [ $chunking_components -eq $chunking_total ]; then
+        echo -e "${GREEN}✅ Smart chunking infrastructure complete ($chunking_components/$chunking_total)${NC}"
+        echo -e "   ${CYAN}SmartMigrationOrchestrator${NC} - Routes files by size/complexity"
+        echo -e "   ${CYAN}ChunkedMigrationProcess${NC} - Handles large file conversion"
+        echo -e "   ${CYAN}ChunkedReverseEngineeringProcess${NC} - Handles large file RE analysis"
+    elif [ $chunking_components -gt 0 ]; then
+        echo -e "${YELLOW}⚠️  Partial smart chunking support ($chunking_components/$chunking_total components)${NC}"
+    else
+        echo -e "${YELLOW}⚠️  Smart chunking infrastructure not found${NC}"
+    fi
+
+    # Verify model deployments
+    echo ""
+    echo "Checking model deployments..."
+    if load_configuration >/dev/null 2>&1 && load_ai_config >/dev/null 2>&1; then
+        if [[ "${AZURE_OPENAI_SERVICE_TYPE}" == "GitHubCopilot" ]]; then
+            echo -e "${GREEN}✅ Using GitHub Copilot SDK — no Azure deployment check needed${NC}"
+            echo -e "  Model: ${AISETTINGS__MODELID:-not set}"
+        else
+            check_model_deployments
+        fi
+    else
+        echo -e "${YELLOW}⚠️  Could not load config to verify deployments${NC}"
+    fi
+
+    echo ""
+    echo -e "${GREEN}🚀 Ready to run migration!${NC}"
+    echo ""
+    echo "Migration Options:"
+    echo "  Standard:         ./doctor.sh run"
+    echo "  Reverse Engineer: dotnet run reverse-engineer --source ./source"
+    echo "  Full Migration:   dotnet run -- --source ./source"
+    echo ""
+    echo "Deterministic COBOL Analysis (Cobol-REKT):"
+    echo "  Parse + ingest:   ./doctor.sh rekt-full"
+    echo "  Parse only:       ./doctor.sh rekt-parse"
+    echo "  Ingest existing:  ./doctor.sh rekt-ingest"
+    echo "  Check status:     ./doctor.sh rekt-status"
+    echo ""
+    if [ $re_components -eq $re_components_total ]; then
+        echo "Reverse Engineering Available:"
+        echo "  Extract business logic from COBOL before migration"
+        echo "  Generate documentation in markdown format"
+        echo "  Run: dotnet run reverse-engineer --source ./source"
+        echo ""
+    fi
+    if [ "$total_files" -gt 0 ]; then
+        echo "Expected Results:"
+        echo "  - Process $cobol_files COBOL files and $copybook_files copybooks"
+        echo "  - Generate Java files to output/java/ OR C# files to output/csharp/"
+        echo "  - Create dependency maps"
+        echo "  - Generate migration reports"
+        echo ""
+        echo "Target Language:"
+        echo "  - Select during migration (Java or C#)"
+        echo "  - Large files auto-split into multiple output files"
+    fi
+}
+
+# Function to select migration speed profile
+# Sets environment variables that override the three-tier reasoning system
+# in appsettings.json via Program.cs OverrideSettingsFromEnvironment().
+select_speed_profile() {
+    echo ""
+    echo "Speed Profile"
+    echo "======================================"
+    echo "  Controls how much reasoning effort the AI model spends per file."
+    echo "  Higher effort means better output quality but slower processing."
+    echo ""
+    echo "  1) TURBO"
+    echo "     Lowest reasoning on ALL files, no exceptions. Speed comes from low"
+    echo "     reasoning effort + parallel file conversion (4 workers). 65K token"
+    echo "     ceiling. Designed for testing and smoke runs."
+    echo ""
+    echo "  2) FAST"
+    echo "     Low reasoning on most files, medium only on the most complex ones."
+    echo "     32K token ceiling, parallel conversion (3 workers). Good for quick"
+    echo "     iterations and proof-of-concept runs."
+    echo ""
+    echo "  3) BALANCED (default)"
+    echo "     Uses the three-tier content-aware reasoning system. Simple files get"
+    echo "     low effort, complex files get high effort. 100K token ceiling,"
+    echo "     parallel conversion (2 workers). Recommended for production."
+    echo ""
+    echo "  4) THOROUGH"
+    echo "     Maximum reasoning on all files regardless of complexity. 100K token"
+    echo "     ceiling, parallel conversion (2 workers). Best for critical codebases"
+    echo "     where accuracy matters more than speed."
+    echo ""
+    read -p "Enter choice (1-4) [default: 3]: " speed_choice
+    speed_choice=$(echo "$speed_choice" | tr -d '[:space:]')
+
+    case "$speed_choice" in
+        1)
+            echo -e "${GREEN}Selected: TURBO${NC}"
+            export CODEX_LOW_REASONING_EFFORT="low"
+            export CODEX_MEDIUM_REASONING_EFFORT="low"
+            export CODEX_HIGH_REASONING_EFFORT="low"
+            export CODEX_MAX_OUTPUT_TOKENS="65536"
+            export CODEX_MIN_OUTPUT_TOKENS="8192"
+            export CODEX_LOW_MULTIPLIER="1.0"
+            export CODEX_MEDIUM_MULTIPLIER="1.0"
+            export CODEX_HIGH_MULTIPLIER="1.5"
+            export CODEX_STAGGER_DELAY_MS="200"
+            export CODEX_MAX_PARALLEL_CONVERSION="4"
+            export CODEX_RATE_LIMIT_SAFETY_FACTOR="0.85"
+            ;;
+        2)
+            echo -e "${GREEN}Selected: FAST${NC}"
+            export CODEX_LOW_REASONING_EFFORT="low"
+            export CODEX_MEDIUM_REASONING_EFFORT="low"
+            export CODEX_HIGH_REASONING_EFFORT="medium"
+            export CODEX_MAX_OUTPUT_TOKENS="32768"
+            export CODEX_MIN_OUTPUT_TOKENS="16384"
+            export CODEX_LOW_MULTIPLIER="1.0"
+            export CODEX_MEDIUM_MULTIPLIER="1.5"
+            export CODEX_HIGH_MULTIPLIER="2.0"
+            export CODEX_STAGGER_DELAY_MS="500"
+            export CODEX_MAX_PARALLEL_CONVERSION="3"
+            ;;
+        4)
+            echo -e "${GREEN}Selected: THOROUGH${NC}"
+            export CODEX_LOW_REASONING_EFFORT="medium"
+            export CODEX_MEDIUM_REASONING_EFFORT="high"
+            export CODEX_HIGH_REASONING_EFFORT="high"
+            export CODEX_MAX_OUTPUT_TOKENS="100000"
+            export CODEX_MIN_OUTPUT_TOKENS="32768"
+            export CODEX_LOW_MULTIPLIER="2.0"
+            export CODEX_MEDIUM_MULTIPLIER="3.0"
+            export CODEX_HIGH_MULTIPLIER="3.5"
+            export CODEX_STAGGER_DELAY_MS="1500"
+            export CODEX_MAX_PARALLEL_CONVERSION="2"
+            ;;
+        3|"")
+            echo -e "${GREEN}Selected: BALANCED (default)${NC}"
+            # Multipliers intentionally not overridden — uses appsettings.json defaults
+            # (1.5/2.5/3.5 with 100K max) for the full three-tier content-aware system.
+            export CODEX_STAGGER_DELAY_MS="1000"
+            export CODEX_MAX_PARALLEL_CONVERSION="2"
+            ;;
+        *)
+            echo -e "${YELLOW}Invalid choice, using BALANCED${NC}"
+            ;;
+    esac
+    echo ""
+}
+
+# Function to run migration
+run_migration() {
+    echo -e "${BLUE}🚀 COBOL Migration Tool${NC}"
+    echo "=============================================="
+
+    echo -e "${BLUE}Using dotnet CLI:${NC} $DOTNET_CMD"
+
+    # Load configuration
+    echo "🔧 Loading AI configuration..."
+    if ! load_configuration; then
+        echo -e "${RED}❌ Configuration loading failed. Please run: ./doctor.sh setup${NC}"
+        return 1
+    fi
+
+    # Load and validate configuration
+    if ! load_ai_config; then
+        echo -e "${RED}❌ Configuration loading failed. Please check your ai-config.local.env file.${NC}"
+        return 1
+    fi
+
+    # Pre-check: verify AI connectivity
+    if ! check_ai_connectivity; then
+        echo -e "${RED}❌ Please fix connection issues first.${NC}"
+        return 1
+    fi
+
+    # Check for existing reverse engineering results
+    local re_output_file="$REPO_ROOT/output/reverse-engineering-details.md"
+    local has_re_report="no"
+    if [ -f "$re_output_file" ]; then
+        has_re_report="yes"
+    fi
+
+    echo ""
+    echo "📋 What would you like to do?"
+    echo "========================================"
+    echo "  1) Full Migration (Analysis + Code Conversion)"
+    echo "  2) Reverse Engineering Report Only (no code conversion)"
+    if [[ "$has_re_report" == "yes" ]]; then
+        echo "  3) Code Conversion Only (use existing RE report)"
+    fi
+    echo ""
+    
+    local max_choice=3
+    # [[ "$has_re_report" == "yes" ]] && max_choice=3
+    
+    read -p "Enter choice (1-$max_choice) [default: 1]: " action_choice
+    
+    # Default to full migration
+    if [[ -z "$action_choice" ]]; then
+        action_choice="1"
+    fi
+
+    # Handle Reverse Engineering Only
+    if [[ "$action_choice" == "2" ]]; then
+        echo ""
+        echo -e "${GREEN}✅ Selected: Reverse Engineering Report Only${NC}"
+        echo ""
+        run_reverse_engineering
+        return $?
+    fi
+
+    # Handle Conversion Only (if RE report exists)
+    if [[ "$action_choice" == "3" ]] && [[ "$has_re_report" == "yes" ]]; then
+        echo ""
+        echo -e "${GREEN}✅ Selected: Code Conversion Only (using existing RE report)${NC}"
+        # Set flag to skip RE and continue to language selection
+        local skip_reverse_eng="--skip-reverse-engineering"
+    else
+        local skip_reverse_eng=""
+    fi
+
+    # For options 1 and 3, continue with language selection and migration
+    echo ""
+    echo "🎯 Select Target Language for Migration"
+    echo "========================================"
+    echo "  1) Java (Quarkus)"
+    echo "  2) C# (.NET)"
+    echo ""
+    read -p "Enter choice (1 or 2) [default: 1]: " lang_choice
+    
+    # Trim whitespace from input
+    lang_choice=$(echo "$lang_choice" | tr -d '[:space:]')
+    
+    # Validate the choice explicitly
+    if [[ "$lang_choice" == "2" ]]; then
+        export TARGET_LANGUAGE="CSharp"
+        echo -e "${GREEN}✅ Selected: C# (.NET)${NC}"
+    elif [[ "$lang_choice" == "1" ]] || [[ -z "$lang_choice" ]]; then
+        export TARGET_LANGUAGE="Java"
+        echo -e "${GREEN}✅ Selected: Java (Quarkus)${NC}"
+    else
+        echo -e "${YELLOW}⚠️  Invalid choice '$lang_choice', defaulting to Java${NC}"
+        export TARGET_LANGUAGE="Java"
+    fi
+
+    # ========================
+    # QUALITY GATE: Verify TARGET_LANGUAGE is correctly set before proceeding
+    # ========================
+    echo ""
+    echo -e "${CYAN}🔒 Quality Gate: Verifying language selection...${NC}"
+    if [[ "$TARGET_LANGUAGE" != "Java" ]] && [[ "$TARGET_LANGUAGE" != "CSharp" ]]; then
+        echo -e "${RED}❌ QUALITY GATE FAILED: TARGET_LANGUAGE='$TARGET_LANGUAGE' is invalid${NC}"
+        echo -e "${RED}   Must be 'Java' or 'CSharp'. Aborting migration.${NC}"
+        return 1
+    fi
+    
+    # Double-check: Ask for confirmation if C# was selected (to prevent accidental Java)
+    if [[ "$TARGET_LANGUAGE" == "CSharp" ]]; then
+        echo -e "${BOLD}${GREEN}▶▶▶ CONFIRMED: Target Language = C# (.NET) ◀◀◀${NC}"
+    else
+        echo -e "${BOLD}${GREEN}▶▶▶ CONFIRMED: Target Language = Java (Quarkus) ◀◀◀${NC}"
+    fi
+    echo -e "${GREEN}✅ Quality Gate PASSED: TARGET_LANGUAGE='$TARGET_LANGUAGE'${NC}"
+    echo ""
+
+    # Select speed profile
+    select_speed_profile
+
+    echo -e "${CYAN}🧩 Smart Chunking: AUTO-ENABLED${NC}"
+    echo "================================"
+    echo "Large files (>150K chars or >3000 lines) will automatically"
+    echo "be split into semantic chunks for optimal processing."
+    echo ""
+    
+    # Launch portal in background for monitoring
+    local db_path="$REPO_ROOT/Data/migration.db"
+    launch_portal_background "$db_path"
+    
+    echo "🚀 Starting COBOL to ${TARGET_LANGUAGE} Migration..."
+    echo "=============================================="
+
+    if [[ -z "$skip_reverse_eng" ]]; then
+        echo ""
+        echo -e "${BLUE}ℹ️  Full migration will include reverse engineering + ${TARGET_LANGUAGE} conversion${NC}"
+        echo ""
+    fi
+
+    # Run the application - smart chunking is auto-detected
+    # Export TARGET_LANGUAGE and output folder so it's available to the dotnet process
+    export TARGET_LANGUAGE
+    export MIGRATION_DB_PATH="$REPO_ROOT/Data/migration.db"
+    export_run_output_folder
+    
+    echo -e "${CYAN}🎯 Target: ${TARGET_LANGUAGE}${NC}"
+    echo -e "${CYAN}💾 Database: $MIGRATION_DB_PATH${NC}"
+    
+    "$DOTNET_CMD" run -- --source ./source $skip_reverse_eng $(program_args)
+    local migration_exit=$?
+
+    if [[ $migration_exit -ne 0 ]]; then
+        echo ""
+        echo -e "${RED}❌ Migration process failed (exit code $migration_exit).${NC}"
+        echo -e "${BLUE}ℹ️  Portal is still running at http://localhost:$DEFAULT_MCP_PORT for debugging${NC}"
+        return $migration_exit
+    fi
+
+    print_jcl_job_summary "$(current_run_output_dir)"
+    
+    # Ask if user wants to generate a migration report
+    echo ""
+    echo -e "${BLUE}📄 Generate Migration Report?${NC}"
+    echo "========================================"
+    read -p "Generate a detailed migration report for this run? (Y/n): " -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]] || [[ -z $REPLY ]]; then
+        generate_migration_report
+    fi
+
+    echo ""
+    echo -e "${GREEN}✅ Migration completed successfully!${NC}"
+    echo -e "${BLUE}🌐 Portal is running at http://localhost:$DEFAULT_MCP_PORT${NC}"
+    echo -e "${CYAN}📊 View results in 'Migration Monitor' or '📄 Reverse Engineering Results'${NC}"
+    echo ""
+    echo -e "${YELLOW}Press Ctrl+C to stop the portal when done viewing.${NC}"
+    
+    # Keep portal running in foreground now
+    if [[ -n "$PORTAL_PID" ]] && kill -0 "$PORTAL_PID" 2>/dev/null; then
+        # Bring portal to foreground by waiting for it
+        wait "$PORTAL_PID"
+    fi
+}
+
+# Function to resume migration
+run_resume() {
+    echo -e "${BLUE}🔄 Resuming COBOL to Java Migration...${NC}"
+    echo "======================================"
+
+    echo -e "${BLUE}Using dotnet CLI:${NC} $DOTNET_CMD"
+
+    # Load configuration
+    if ! load_configuration || ! load_ai_config; then
+        echo -e "${RED}❌ Configuration loading failed. Please check your setup.${NC}"
+        return 1
+    fi
+
+    echo ""
+    echo "Checking for resumable migration state..."
+    
+    # Check for existing partial results
+    if [ -d "$REPO_ROOT/output" ] && [ "$(ls -A $REPO_ROOT/output 2>/dev/null)" ]; then
+        echo -e "${GREEN}✅ Found existing migration output${NC}"
+        echo "Resuming from last position..."
+    else
+        echo -e "${YELLOW}⚠️  No previous migration state found${NC}"
+        echo "Starting fresh migration..."
+    fi
+
+    # Run with resume logic
+    export MIGRATION_DB_PATH="$REPO_ROOT/Data/migration.db"
+    "$DOTNET_CMD" run -- --source ./source --resume $(program_args)
+}
+
+# Function to monitor migration
+run_monitor() {
+    echo -e "${BLUE}📊 Migration Progress Monitor${NC}"
+    echo "============================"
+
+    if [ ! -d "$REPO_ROOT/Logs" ]; then
+        echo -e "${YELLOW}⚠️  No logs directory found${NC}"
+        return 1
+    fi
+
+    echo "Monitoring migration logs..."
+    echo "Press Ctrl+C to exit monitoring"
+    echo ""
+
+    # Monitor log files for progress
+    tail -f "$REPO_ROOT/Logs"/*.log 2>/dev/null || echo "No active log files found"
+}
+
+# Function to validate system
+run_validate() {
+    echo -e "${BLUE}✅ System Validation${NC}"
+    echo "==================="
+
+    errors=0
+
+    # Check .NET
+    if command -v dotnet >/dev/null 2>&1; then
+        echo -e "${GREEN}✅ .NET CLI available${NC}"
+    else
+        echo -e "${RED}❌ .NET CLI not found${NC}"
+        ((errors++))
+    fi
+
+    # Check configuration files
+    required_files=(
+        "Config/ai-config.env.example"
+        "Config/load-config.sh"
+        "Config/appsettings.json"
+        "CobolToQuarkusMigration.csproj"
+        "Program.cs"
+    )
+
+    for file in "${required_files[@]}"; do
+    if [ -f "$REPO_ROOT/$file" ]; then
+            echo -e "${GREEN}✅ $file${NC}"
+        else
+            echo -e "${RED}❌ Missing: $file${NC}"
+            ((errors++))
+        fi
+    done
+
+    # Check directories
+    for dir in "source" "output"; do
+    if [ -d "$REPO_ROOT/$dir" ]; then
+            echo -e "${GREEN}✅ Directory: $dir${NC}"
+        else
+            echo -e "${YELLOW}⚠️  Creating directory: $dir${NC}"
+            mkdir -p "$REPO_ROOT/$dir"
+        fi
+    done
+
+    # Validate reverse engineering components
+    echo ""
+    echo "Checking reverse engineering feature..."
+    re_valid=0
+    [ -f "$REPO_ROOT/Models/BusinessLogic.cs" ] && ((re_valid++))
+    [ -f "$REPO_ROOT/Agents/BusinessLogicExtractorAgent.cs" ] && ((re_valid++))
+    [ -f "$REPO_ROOT/Processes/ReverseEngineeringProcess.cs" ] && ((re_valid++))
+    
+    if [ $re_valid -eq 3 ]; then
+        echo -e "${GREEN}✅ Reverse engineering feature: Complete (3/3 components)${NC}"
+    elif [ $re_valid -gt 0 ]; then
+        echo -e "${YELLOW}⚠️  Reverse engineering feature: Incomplete ($re_valid/3 components)${NC}"
+        ((errors++))
+    else
+        echo -e "${BLUE}ℹ️  Reverse engineering feature: Not installed (optional)${NC}"
+    fi
+    
+    # Validate smart chunking infrastructure (v0.2)
+    echo ""
+    echo "Checking smart chunking infrastructure (v0.2)..."
+    chunk_valid=0
+    [ -f "$REPO_ROOT/Processes/SmartMigrationOrchestrator.cs" ] && ((chunk_valid++))
+    [ -f "$REPO_ROOT/Processes/ChunkedMigrationProcess.cs" ] && ((chunk_valid++))
+    [ -f "$REPO_ROOT/Processes/ChunkedReverseEngineeringProcess.cs" ] && ((chunk_valid++))
+    [ -f "$REPO_ROOT/Chunking/ChunkingOrchestrator.cs" ] && ((chunk_valid++))
+    
+    if [ $chunk_valid -eq 4 ]; then
+        echo -e "${GREEN}✅ Smart chunking infrastructure: Complete (4/4 components)${NC}"
+    elif [ $chunk_valid -gt 0 ]; then
+        echo -e "${YELLOW}⚠️  Smart chunking infrastructure: Incomplete ($chunk_valid/4 components)${NC}"
+    else
+        echo -e "${YELLOW}⚠️  Smart chunking infrastructure: Not found${NC}"
+    fi
+
+    if [ $errors -eq 0 ]; then
+        echo -e "${GREEN}🎉 System validation passed!${NC}"
+        return 0
+    else
+        echo -e "${RED}❌ System validation failed with $errors errors${NC}"
+        return 1
+    fi
+}
+
+# Function for conversation log generation
+run_conversation() {
+    echo -e "${BLUE}💭 Conversation Log Generator${NC}"
+    echo "=============================="
+
+    echo -e "${BLUE}Using dotnet CLI:${NC} $DOTNET_CMD"
+    
+    # Load configuration
+    if ! load_configuration || ! load_ai_config; then
+        echo -e "${RED}❌ Configuration loading failed.${NC}"
+        return 1
+    fi
+
+    echo "Generating readable conversation log from migration data..."
+    echo ""
+
+    export MIGRATION_DB_PATH="$REPO_ROOT/Data/migration.db"
+    "$DOTNET_CMD" run -- conversation
+}
+
+# Function for reverse engineering
+run_reverse_engineering() {
+    echo -e "${BLUE}🔍 Running Reverse Engineering Analysis${NC}"
+    echo "========================================"
+
+    echo -e "${BLUE}Using dotnet CLI:${NC} $DOTNET_CMD"
+
+    # Load configuration
+    echo "🔧 Loading AI configuration..."
+    if ! load_configuration; then
+        echo -e "${RED}❌ Configuration loading failed. Please run: ./doctor.sh setup${NC}"
+        return 1
+    fi
+
+    # Load and validate configuration
+    if ! load_ai_config; then
+        echo -e "${RED}❌ Configuration loading failed. Please check your ai-config.local.env file.${NC}"
+        return 1
+    fi
+
+    # Pre-check: verify AI connectivity
+    if ! check_ai_connectivity; then
+        echo -e "${RED}❌ Please fix connection issues first.${NC}"
+        return 1
+    fi
+
+    # Check if reverse engineering components are present
+    if [ ! -f "$REPO_ROOT/Processes/ReverseEngineeringProcess.cs" ]; then
+        echo -e "${RED}❌ Reverse engineering feature not found.${NC}"
+        echo "This feature may not be available in your version."
+        return 1
+    fi
+
+    # Select speed profile
+    select_speed_profile
+
+    echo ""
+    echo "🔍 Starting Reverse Engineering Analysis..."
+    echo "=========================================="
+    echo ""
+    echo "This will:"
+    echo "  • Extract business logic as feature descriptions and use cases"
+    echo "  • Analyze modernization opportunities"
+    echo "  • Generate markdown documentation"
+    echo ""
+
+    # Check for COBOL files
+    cobol_count=$(find "$REPO_ROOT/source" -name "*.cbl" 2>/dev/null | wc -l)
+    copybook_count=$(find "$REPO_ROOT/source" -name "*.cpy" 2>/dev/null | wc -l)
+    total_count=$((cobol_count + copybook_count))
+    
+    if [ "$total_count" -eq 0 ]; then
+        echo -e "${YELLOW}⚠️  No COBOL files or copybooks found in ./source/${NC}"
+        echo "Add COBOL files to analyze and try again."
+        return 1
+    fi
+
+    if [ "$cobol_count" -gt 0 ]; then
+        echo -e "Found ${GREEN}$cobol_count${NC} COBOL file(s) to analyze"
+    fi
+    if [ "$copybook_count" -gt 0 ]; then
+        echo -e "Found ${GREEN}$copybook_count${NC} copybook(s) to analyze"
+    fi
+    echo ""
+
+    # Show file size info
+    local total_lines=0
+    local large_file_count=0
+    if command -v wc >/dev/null 2>&1; then
+        total_lines=$(find "$REPO_ROOT/source" -name "*.cbl" -exec wc -l {} + 2>/dev/null | tail -1 | awk '{print $1}')
+        # Count files over threshold
+        while IFS= read -r file; do
+            local lines=$(wc -l < "$file" 2>/dev/null | tr -d ' ')
+            if [[ "$lines" -gt 3000 ]]; then
+                large_file_count=$((large_file_count + 1))
+            fi
+        done < <(find "$REPO_ROOT/source" -name "*.cbl" 2>/dev/null)
+        
+        if [[ "$large_file_count" -gt 0 ]]; then
+            echo -e "${CYAN}🧩 Smart Chunking: AUTO-ENABLED${NC}"
+            echo "   Large files detected: $large_file_count file(s) over threshold"
+            echo "   Files >150K chars or >3000 lines will use ChunkedReverseEngineeringProcess"
+            echo "   Semantic boundary detection preserves paragraph/section context"
+            echo ""
+        fi
+    fi
+
+    # Launch portal in background for monitoring
+    launch_portal_background
+
+    # Run the reverse engineering command - chunking is auto-detected
+    export MIGRATION_DB_PATH="$REPO_ROOT/Data/migration.db"
+    "$DOTNET_CMD" run reverse-engineer --source ./source $(program_args)
+
+    local exit_code=$?
+
+    if [ $exit_code -eq 0 ]; then
+        echo ""
+        echo -e "${GREEN}✅ Reverse engineering completed successfully!${NC}"
+        echo ""
+        echo "Output files created in: ./output/"
+        echo "  • reverse-engineering-details.md - Complete analysis with business logic and technical details"
+        echo "  • Results persisted to database — use './doctor.sh convert-only' and answer 'y' to"
+        echo "    inject them into conversion prompts (or pass --skip-reverse-engineering --reuse-re)"
+        echo ""
+        echo -e "${CYAN}📄 View in Portal:${NC}"
+        echo "  • Portal running at: http://localhost:5028"
+        echo "  • Click '📄 Reverse Engineering Results' button to view the full RE report"
+        echo "  • Each run card now has a '🔬 RE Results' button to view or delete persisted results"
+        echo ""
+        echo "Next steps:"
+        echo "  • Review the generated documentation in portal or output folder"
+        echo "  • Run full migration: ./doctor.sh run"
+        echo "  • Or run conversion only with RE context: ./doctor.sh convert-only  (answer 'y' to reuse)"
+        echo ""
+        echo -e "${CYAN}Portal is running. Press Ctrl+C to stop.${NC}"
+        
+        # Keep portal running
+        if [ -n "$PORTAL_PID" ]; then
+            wait $PORTAL_PID 2>/dev/null
+        fi
+    else
+        echo ""
+        echo -e "${RED}❌ Reverse engineering failed (exit code $exit_code)${NC}"
+        if [ -n "$PORTAL_PID" ]; then
+            echo -e "${YELLOW}Portal is still running at http://localhost:5028 for debugging${NC}"
+        fi
+    fi
+
+    return $exit_code
+}
+
+# Function to run conversion-only (skip reverse engineering)
+run_conversion_only() {
+    echo -e "${BLUE}🔄 Starting COBOL to Java Conversion (Skip Reverse Engineering)${NC}"
+    echo "================================================================"
+
+    echo -e "${BLUE}Using dotnet CLI:${NC} $DOTNET_CMD"
+
+    # Load configuration
+    echo "🔧 Loading AI configuration..."
+    if ! load_configuration; then
+        echo -e "${RED}❌ Configuration loading failed. Please run: ./doctor.sh setup${NC}"
+        return 1
+    fi
+
+    # Load and validate configuration
+    if ! load_ai_config; then
+        echo -e "${RED}❌ Configuration loading failed. Please check your ai-config.local.env file.${NC}"
+        return 1
+    fi
+
+    # Pre-check: verify AI connectivity
+    if ! check_ai_connectivity; then
+        echo -e "${RED}❌ Please fix connection issues first.${NC}"
+        return 1
+    fi
+
+    # Select speed profile
+    select_speed_profile
+
+    echo ""
+    echo "🔄 Starting Conversion Only..."
+    echo "=============================="
+    echo ""
+    echo -e "${BLUE}ℹ️  Reverse engineering will be skipped${NC}"
+    echo ""
+
+    # ------------------------------------------------------------------
+    # BUSINESS LOGIC REUSE PROMPT
+    # ------------------------------------------------------------------
+    echo -e "${BOLD}♻️  Reuse Business Logic from a Previous RE Run?${NC}"
+    echo "============================================================"
+    echo "  If you ran reverse engineering on this source before, its business"
+    echo "  logic can be injected into the conversion prompts. Off by default:"
+    echo "  in testing it made the converters follow the summary and drop"
+    echo "  COBOL paths such as error and abend handling."
+    echo ""
+    read -p "Reuse business logic from last RE run? (y/N): " -r
+    echo ""
+    local reuse_re_flag=""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        reuse_re_flag="--reuse-re"
+        echo -e "${GREEN}✅ Will load business logic from previous RE run and inject into prompts${NC}"
+    else
+        echo -e "${BLUE}ℹ️  Pure conversion mode — no business logic context will be used${NC}"
+    fi
+    echo ""
+
+    # ------------------------------------------------------------------
+    # TARGET LANGUAGE SELECTION (if not already set)
+    # ------------------------------------------------------------------
+    if [[ -z "$TARGET_LANGUAGE" ]]; then
+        echo "🎯 Select Target Language"
+        echo "========================"
+        echo "  1) Java (Quarkus)"
+        echo "  2) C# (.NET)"
+        echo ""
+        read -p "Enter choice (1 or 2) [default: 1]: " lang_choice
+        lang_choice=$(echo "$lang_choice" | tr -d '[:space:]')
+        
+        if [[ "$lang_choice" == "2" ]]; then
+            export TARGET_LANGUAGE="CSharp"
+            echo -e "${GREEN}✅ Selected: C# (.NET)${NC}"
+        elif [[ "$lang_choice" == "1" ]] || [[ -z "$lang_choice" ]]; then
+            export TARGET_LANGUAGE="Java"
+            echo -e "${GREEN}✅ Selected: Java (Quarkus)${NC}"
+        else
+            echo -e "${YELLOW}⚠️  Invalid choice, defaulting to Java${NC}"
+            export TARGET_LANGUAGE="Java"
+        fi
+        echo ""
+    fi
+    # Export output folder variables based on language selection
+    export_run_output_folder
+
+    # Run the application with skip-reverse-engineering flag
+    export MIGRATION_DB_PATH="$REPO_ROOT/Data/migration.db"
+    
+    # Check for resume flag
+    resume_flag=""
+    if [[ "$1" == "--resume" ]]; then
+        resume_flag="--resume"
+    fi
+    
+    "$DOTNET_CMD" run -- --source ./source --skip-reverse-engineering $reuse_re_flag $resume_flag $(program_args)
+    local migration_exit=$?
+
+    if [[ $migration_exit -ne 0 ]]; then
+        echo ""
+        echo -e "${RED}❌ Conversion process failed (exit code $migration_exit). Skipping MCP web UI launch.${NC}"
+        return $migration_exit
+    fi
+
+    print_jcl_job_summary "$(current_run_output_dir)"
+
+    local db_path
+    if ! db_path="$(get_migration_db_path)" || [[ -z "$db_path" ]]; then
+        echo ""
+        echo -e "${YELLOW}⚠️  Could not resolve migration database path. MCP web UI will not be started automatically.${NC}"
+        return 0
+    fi
+
+    if [[ "${MCP_AUTO_LAUNCH:-1}" != "1" ]]; then
+        echo ""
+        echo -e "${BLUE}ℹ️  MCP web UI launch skipped (MCP_AUTO_LAUNCH set to ${MCP_AUTO_LAUNCH}).${NC}"
+        echo -e "Use ${BOLD}MIGRATION_DB_PATH=$db_path ASPNETCORE_URLS=http://$DEFAULT_MCP_HOST:$DEFAULT_MCP_PORT $DOTNET_CMD run --project \"$REPO_ROOT/McpChatWeb\"${NC} to start manually."
+        return 0
+    fi
+
+    launch_mcp_web_ui "$db_path"
+}
+
+# Cobol-REKT Integration
+
+# Container names and host ports come from the environment, then Config/ai-config.local.env,
+# then these defaults, so two checkouts on one machine can run side by side. They are
+# exported because docker-compose.yml reads the same variables.
+resolve_runtime_setting() {
+    local key="$1" default="$2" value="${!1:-}"
+    [[ -n "$value" ]] || value="$(read_local_config_value "$key")"
+    printf '%s' "${value:-$default}"
+}
+NEO4J_CONTAINER="$(resolve_runtime_setting NEO4J_CONTAINER cobol-migration-neo4j)"
+NEO4J_HTTP_PORT="$(resolve_runtime_setting NEO4J_HTTP_PORT 7474)"
+NEO4J_BOLT_PORT="$(resolve_runtime_setting NEO4J_BOLT_PORT 7687)"
+REKT_CONTAINER="$(resolve_runtime_setting REKT_CONTAINER cobol-rekt)"
+REKT_POPULATOR_CONTAINER="$(resolve_runtime_setting REKT_POPULATOR_CONTAINER cobol-graph-populator)"
+PORTAL_CONTAINER="$(resolve_runtime_setting PORTAL_CONTAINER cobol-migration-portal)"
+REKT_GENERATED_COPYBOOK_DIRS="$(resolve_runtime_setting REKT_GENERATED_COPYBOOK_DIRS copy-generated)"
+export NEO4J_CONTAINER NEO4J_HTTP_PORT NEO4J_BOLT_PORT REKT_CONTAINER REKT_POPULATOR_CONTAINER PORTAL_CONTAINER \
+    REKT_GENERATED_COPYBOOK_DIRS
+# A moved port is passed on to the CLI and portal; otherwise their own settings apply unchanged.
+if [[ "$NEO4J_BOLT_PORT" != "7687" && -z "${ApplicationSettings__Neo4j__Uri:-}" ]]; then
+    export ApplicationSettings__Neo4j__Uri="bolt://localhost:$NEO4J_BOLT_PORT"
+fi
+compose_project_name() {
+    local name="${COMPOSE_PROJECT_NAME:-$(basename "$REPO_ROOT")}"
+    printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-'
+}
+
+# A wrong password is invisible from outside: each container's healthcheck uses the credential
+# baked into it at creation and stays healthy, while the run only warns that the graph is
+# skipped. Another checkout on the same machine can also hold the default names and ports.
+check_neo4j_graphs() {
+    command -v docker >/dev/null 2>&1 || return 0
+    docker info >/dev/null 2>&1 || return 0
+
+    echo
+    echo -e "${BLUE}🔍 Checking Neo4j graphs...${NC}"
+    local project entry name key port state owner password holder problems=0
+    project="$(compose_project_name)"
+    for entry in "$NEO4J_CONTAINER:NEO4J_PASSWORD:$NEO4J_BOLT_PORT"; do
+        IFS=: read -r name key port <<<"$entry"
+
+        holder=$(docker ps --filter "publish=$port" --format '{{.Names}}' 2>/dev/null | grep -vx "$name" | head -1)
+        if [[ -n "$holder" ]]; then
+            echo -e "  ${RED}❌ Port $port (for $name) is already published by $holder${NC}"
+            problems=$((problems + 1))
+        fi
+
+        if ! state=$(docker inspect --format '{{.State.Status}}' "$name" 2>/dev/null); then
+            echo -e "  ${BLUE}ℹ️  $name: not created yet${NC}"
+            continue
+        fi
+        owner=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' "$name" 2>/dev/null)
+        if [[ -n "$owner" && "$owner" != "$project" ]]; then
+            echo -e "  ${RED}❌ $name belongs to another checkout (compose project '$owner')${NC}"
+            problems=$((problems + 1))
+            continue
+        fi
+        if [[ "$state" != "running" ]]; then
+            echo -e "  ${BLUE}ℹ️  $name: $state${NC}"
+            continue
+        fi
+
+        password="$(read_local_config_value "$key")"
+        if container_exec "$name" cypher-shell -u neo4j -p "$password" "RETURN 1" >/dev/null 2>&1; then
+            echo -e "  ${GREEN}✅ $name: $key authenticates${NC}"
+        else
+            echo -e "  ${RED}❌ $name: $key in Config/ai-config.local.env does not authenticate${NC}"
+            echo "     The password was fixed when its data volume was first created. Set that value,"
+            echo "     or remove the container and its volume to re-initialise the graph."
+            problems=$((problems + 1))
+        fi
+    done
+
+    if (( problems > 0 )); then
+        echo
+        echo "  To run beside another checkout, give this one its own names and ports in"
+        echo "  Config/ai-config.local.env (see 'Containers and ports' in Config/ai-config.env.example):"
+        echo "    NEO4J_CONTAINER, NEO4J_HTTP_PORT, NEO4J_BOLT_PORT"
+    fi
+
+    check_single_graph_migration || problems=$((problems + 1))
+    (( problems == 0 ))
+}
+
+# The migration and REKT graphs used to live in two instances. Their settings are ignored now,
+# and their volumes still hold the old data, so both are pointed out once rather than
+# silently kept or deleted.
+check_single_graph_migration() {
+    local obsolete=() key volume project leftover=()
+    for key in REKT_NEO4J_PASSWORD REKT_NEO4J_CONTAINER REKT_NEO4J_HTTP_PORT REKT_NEO4J_BOLT_PORT REKT_NEO4J_URI; do
+        [[ -n "$(read_local_config_value "$key")" || -n "$(printenv "$key")" ]] && obsolete+=("$key")
+    done
+    project="$(compose_project_name)"
+    for volume in neo4j_data neo4j_logs neo4j_import rekt_neo4j_data rekt_neo4j_logs rekt_neo4j_import; do
+        docker volume inspect "${project}_${volume}" >/dev/null 2>&1 && leftover+=("${project}_${volume}")
+    done
+    (( ${#obsolete[@]} + ${#leftover[@]} > 0 )) || return 0
+
+    echo
+    echo -e "  ${YELLOW}ℹ️  The migration and REKT graphs now share one Neo4j ($NEO4J_CONTAINER).${NC}"
+    if (( ${#obsolete[@]} > 0 )); then
+        echo "     No longer used; remove from Config/ai-config.local.env: ${obsolete[*]}"
+    fi
+    if (( ${#leftover[@]} > 0 )); then
+        echo "     Volumes from the two earlier instances can be removed once ./doctor.sh rekt-ingest"
+        echo "     has filled the new graph:"
+        echo "       docker volume rm ${leftover[*]}"
+    fi
+    (( ${#obsolete[@]} == 0 ))
+}
+
+# Compose commands take service names, which stay fixed while container names vary.
+NEO4J_SERVICE="neo4j"
+REKT_SERVICE="cobol-rekt"
+
+# Current Docker ships Compose as a plugin; older installs only have the standalone binary.
+# docker exec with container-side paths (/app, /source, /output). Git Bash rewrites any
+# argument that looks like a POSIX path into a Windows one (/source -> C:/Program Files/Git/source),
+# so path conversion is switched off for these calls only; host paths elsewhere still need it.
+container_exec() {
+    MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' docker exec "$@"
+}
+
+run_compose() {
+    if docker compose version >/dev/null 2>&1; then
+        docker compose -f "$REPO_ROOT/docker-compose.yml" "$@"
+    else
+        docker-compose -f "$REPO_ROOT/docker-compose.yml" "$@"
+    fi
+}
+# Written by tools/preprocess-for-rekt.sh into synthesised copybooks and read by
+# StubCopybookCatalog.Marker. It is the only reliable way to tell an invented layout from
+# real content, because both live in source/.preprocessed/.
+REKT_STUB_MARKER="AUTO-GENERATED STUB COPYBOOK"
+NEO4J_IMAGE="neo4j:5.15.0"
+
+# Match the Docker daemon API instead of forcing a client version.
+detect_docker_api_version() {
+    local server_api
+    server_api=$(
+        unset DOCKER_API_VERSION
+        docker version --format '{{.Server.APIVersion}}' 2>/dev/null
+    )
+
+    if [[ -n "$server_api" ]]; then
+        export DOCKER_API_VERSION="$server_api"
+    else
+        unset DOCKER_API_VERSION
+    fi
+}
+
+ensure_neo4j_image() {
+    detect_docker_api_version
+
+    if ! command -v docker >/dev/null 2>&1; then
+        echo -e "${RED}❌ Docker is required to install the Neo4j image.${NC}"
+        return 1
+    fi
+
+    if docker image inspect "$NEO4J_IMAGE" >/dev/null 2>&1; then
+        echo -e "${GREEN}✅ Neo4j image is available: $NEO4J_IMAGE${NC}"
+        return 0
+    fi
+
+    echo -e "${BLUE}📦 Pulling Neo4j image: $NEO4J_IMAGE${NC}"
+    local pull_output
+    if ! pull_output=$(docker pull "$NEO4J_IMAGE" 2>&1); then
+        echo -e "${RED}❌ Failed to pull Neo4j image:${NC}"
+        printf '%s\n' "$pull_output" | sed 's/^/  /'
+        echo ""
+        echo -e "${YELLOW}Retry with:${NC}"
+        echo "  docker pull $NEO4J_IMAGE"
+        return 1
+    fi
+
+    echo -e "${GREEN}✅ Neo4j image downloaded: $NEO4J_IMAGE${NC}"
+}
+
+# Interpreter inside the graph populator venv: bin/python on Linux/macOS, Scripts/python.exe on Windows.
+graph_populator_python() {
+    local venv="$REPO_ROOT/tools/graph-populator/.venv"
+    if [[ -x "$venv/Scripts/python.exe" ]]; then
+        echo "$venv/Scripts/python.exe"
+    elif [[ -x "$venv/bin/python" ]]; then
+        echo "$venv/bin/python"
+    else
+        case "$(uname -s)" in
+            MINGW*|MSYS*|CYGWIN*) echo "$venv/Scripts/python.exe" ;;
+            *) echo "$venv/bin/python" ;;
+        esac
+    fi
+}
+
+ensure_graph_populator_environment() {
+    local populator_dir="$REPO_ROOT/tools/graph-populator"
+    local requirements_file="$populator_dir/requirements.txt"
+    local venv_python
+    venv_python="$(graph_populator_python)"
+
+    if [[ ! -f "$populator_dir/populator.py" || ! -f "$requirements_file" ]]; then
+        echo -e "${RED}❌ Graph populator sources are incomplete: $populator_dir${NC}"
+        return 1
+    fi
+
+    if [[ -z "$PYTHON_CMD" ]]; then
+        echo -e "${RED}❌ Python is required for the REKT graph populator.${NC}"
+        return 1
+    fi
+
+    if [[ ! -x "$venv_python" ]]; then
+        echo -e "${BLUE}🐍 Creating graph populator virtual environment...${NC}"
+        local venv_output
+        if ! venv_output=$("$PYTHON_CMD" -m venv "$populator_dir/.venv" 2>&1); then
+            echo -e "${RED}❌ Failed to create graph populator virtual environment:${NC}"
+            printf '%s\n' "$venv_output" | sed 's/^/  /'
+            return 1
+        fi
+    fi
+
+    if ! "$venv_python" -c 'import click, neo4j, networkx, orjson, rich' >/dev/null 2>&1; then
+        echo -e "${BLUE}📦 Installing graph populator dependencies...${NC}"
+        local install_output
+        if ! install_output=$("$venv_python" -m pip install -r "$requirements_file" 2>&1); then
+            echo -e "${RED}❌ Failed to install graph populator dependencies:${NC}"
+            printf '%s\n' "$install_output" | sed 's/^/  /'
+            echo ""
+            echo -e "${YELLOW}Retry with:${NC}"
+            echo "  $venv_python -m pip install -r $requirements_file"
+            return 1
+        fi
+    fi
+
+    echo -e "${GREEN}✅ Graph populator environment is ready${NC}"
+}
+
+ensure_rekt_containers() {
+    detect_docker_api_version
+    echo -e "${BLUE}🔧 Ensuring rekt containers are running...${NC}"
+
+    if [[ -z "${NEO4J_PASSWORD:-}" ]]; then
+        load_configuration >/dev/null 2>&1 || true
+    fi
+
+    if [[ -z "${NEO4J_PASSWORD:-}" ]]; then
+        if [[ ! -f "$REPO_ROOT/Config/ai-config.local.env" ]]; then
+            echo -e "${RED}❌ Neo4j configuration is missing: Config/ai-config.local.env${NC}"
+            echo ""
+            echo "Create it through the interactive setup:"
+            echo "  ./doctor.sh setup"
+            return 1
+        fi
+
+        if ! grep -Eq '^[[:space:]]*NEO4J_PASSWORD[[:space:]]*=[[:space:]]*[^[:space:]#]+' "$REPO_ROOT/Config/ai-config.local.env"; then
+            echo -e "${RED}❌ NEO4J_PASSWORD is empty in Config/ai-config.local.env${NC}"
+            echo ""
+            echo "Edit Config/ai-config.local.env and set a strong local password:"
+            echo "  NEO4J_PASSWORD=<your-local-password>"
+            return 1
+        fi
+    fi
+
+    ensure_neo4j_image || return 1
+
+    # Start only the rekt services (leave existing neo4j untouched).
+    local compose_output
+    if ! compose_output=$(run_compose up -d "$NEO4J_SERVICE" "$REKT_SERVICE" 2>&1); then
+        echo -e "${RED}❌ Failed to start Cobol-REKT containers:${NC}"
+        printf '%s\n' "$compose_output" | sed 's/^/  /'
+        echo ""
+        echo -e "${YELLOW}Debug with:${NC}"
+        echo "  docker compose ps"
+        echo "  docker compose logs --tail=100 $NEO4J_SERVICE $REKT_SERVICE"
+        return 1
+    fi
+
+    # Wait for rekt Neo4j to be healthy
+    local max_wait=60
+    local waited=0
+    echo -ne "  Waiting for $NEO4J_CONTAINER"
+    while ! container_exec "$NEO4J_CONTAINER" sh -c \
+        'cypher-shell -u neo4j -p "$HEALTHCHECK_PASSWORD" "RETURN 1"' >/dev/null 2>&1; do
+        sleep 2
+        waited=$((waited + 2))
+        echo -ne "."
+        if [[ $waited -ge $max_wait ]]; then
+            echo -e "\n${RED}❌ $NEO4J_CONTAINER did not become healthy in ${max_wait}s${NC}"
+            echo -e "${YELLOW}Container state:${NC}"
+            docker inspect --format \
+                '  Status={{.State.Status}} ExitCode={{.State.ExitCode}} Error={{.State.Error}} Health={{if .State.Health}}{{.State.Health.Status}}{{else}}n/a{{end}}' \
+                "$NEO4J_CONTAINER" 2>&1 || true
+            echo ""
+            echo -e "${YELLOW}Recent $NEO4J_CONTAINER logs:${NC}"
+            docker logs --tail 50 "$NEO4J_CONTAINER" 2>&1 | sed 's/^/  /'
+            echo ""
+            echo -e "${YELLOW}Debug with:${NC}"
+            echo "  docker compose ps"
+            echo "  docker compose logs --tail=100 $NEO4J_SERVICE"
+            return 1
+        fi
+    done
+    echo -e " ${GREEN}✅${NC}"
+
+    # The loop above authenticates inside the container, which always agrees with itself.
+    # The populator connects from the host, so verify that credential separately: Neo4j keeps
+    # the password in its data volume, so a reused volume silently outranks NEO4J_AUTH.
+    if ! container_exec "$NEO4J_CONTAINER" \
+        cypher-shell -u neo4j -p "$NEO4J_PASSWORD" "RETURN 1" >/dev/null 2>&1; then
+        echo -e "${RED}❌ NEO4J_PASSWORD does not authenticate against $NEO4J_CONTAINER${NC}"
+        echo ""
+        echo "The password was fixed when the data volume was first created, and NEO4J_AUTH"
+        echo "is ignored on every start after that."
+        echo ""
+        echo "Either set the value the volume was created with, in Config/ai-config.local.env:"
+        echo "  NEO4J_PASSWORD=<existing-password>"
+        echo ""
+        echo "or discard the graph and let it re-initialise. This also clears the migration"
+        echo "graph; parsed artifacts and the SQLite run history are kept:"
+        echo "  docker compose rm -sf $NEO4J_SERVICE"
+        echo "  docker volume rm $(compose_project_name)_graph_data"
+        return 1
+    fi
+    echo -e "  ${GREEN}✅ REKT graph credentials accepted${NC}"
+
+    # Verify rekt CLI is available
+    if container_exec "$REKT_CONTAINER" java -jar /app/smojol-cli.jar --version >/dev/null 2>&1; then
+        echo -e "  ${GREEN}✅ Cobol-REKT CLI available${NC}"
+    else
+        echo -e "  ${YELLOW}⚠️  Cobol-REKT CLI not responding (container may still be building)${NC}"
+    fi
+
+    # Verify /output bind mount is writable — rm -rf on the host changes the inode and breaks it.
+    # Restart the container to re-establish the mount if needed.
+    if ! container_exec "$REKT_CONTAINER" bash -c \
+        "touch /output/.write_probe && rm -f /output/.write_probe" >/dev/null 2>&1; then
+        echo -e "  ${YELLOW}⚠️  /output bind mount stale — restarting $REKT_CONTAINER...${NC}"
+        docker restart "$REKT_CONTAINER" >/dev/null
+        sleep 3
+        if ! container_exec "$REKT_CONTAINER" bash -c \
+            "touch /output/.write_probe && rm -f /output/.write_probe" >/dev/null 2>&1; then
+            echo -e "  ${RED}❌ /output still not writable after restart. Check Docker volume mount.${NC}"
+            return 1
+        fi
+        echo -e "  ${GREEN}✅ Bind mount restored${NC}"
+    fi
+}
+
+run_rekt_parse() {
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║   Cobol-REKT: Parse COBOL → AST/CFG/Data JSON              ║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+
+    detect_docker_api_version
+    ensure_rekt_containers || return 1
+
+    # The portal resolves the estate through COBOL_SOURCE_FOLDER while this script parses
+    # source/. When they disagree the parse succeeds and every portal view reads empty,
+    # with nothing to explain why.
+    local configured_source="${COBOL_SOURCE_FOLDER:-source}"
+    if [[ "$configured_source" != "source" ]]; then
+        echo -e "${RED}❌ COBOL_SOURCE_FOLDER is '$configured_source' but the parser reads source/${NC}"
+        echo ""
+        echo "Artifacts would be written for source/ while the portal reads"
+        echo "$configured_source/, leaving every modernization view empty."
+        echo ""
+        echo "Set this in Config/ai-config.local.env:"
+        echo "  COBOL_SOURCE_FOLDER=\"source\""
+        return 1
+    fi
+
+    local cobol_count
+    cobol_count=$(find "$REPO_ROOT/source" \
+        \( -name "*.cbl" -o -name "*.CBL" -o -name "*.cob" -o -name "*.COB" \) \
+        ! -path "*/.rekt-staging/*" \
+        ! -path "*/.preprocessed/*" \
+        2>/dev/null | wc -l | tr -d ' ')
+    local copy_count
+    copy_count=$(find "$REPO_ROOT/source" \
+        \( -name "*.cpy" -o -name "*.CPY" \) \
+        ! -path "*/.rekt-staging/*" \
+        ! -path "*/.preprocessed/*" \
+        2>/dev/null | wc -l | tr -d ' ')
+
+    echo -e "${BLUE}  Found: ${cobol_count} programs, ${copy_count} copybooks${NC}"
+
+    if [[ "$cobol_count" -eq 0 ]]; then
+        echo -e "${RED}❌ No .cbl/.cob files found in source/. Drop COBOL files there first.${NC}"
+        return 1
+    fi
+
+    # Copybooks are staged into one flat folder, so two with the same name cannot both be used.
+    # A generated stand-in (a folder named in REKT_GENERATED_COPYBOOK_DIRS) gives way to the one
+    # real copybook of that name; the preprocessor, the collision check and staging all skip it.
+    local shadowed_copybooks_file
+    shadowed_copybooks_file="$(mktemp)"
+    "$PYTHON_CMD" - "$REPO_ROOT/source" "$REKT_GENERATED_COPYBOOK_DIRS" > "$shadowed_copybooks_file" <<'PYEOF'
+import os, sys
+
+source_root = sys.argv[1]
+generated_dirs = {d.strip().lower() for d in sys.argv[2].split(',') if d.strip()}
+skip_dirs = {'.preprocessed', '.rekt-staging'}
+copybooks = {}
+for root, dirs, files in os.walk(source_root):
+    dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith('.convert-')]
+    for name in files:
+        if name.lower().endswith('.cpy'):
+            copybooks.setdefault(name.lower(), []).append(os.path.join(root, name))
+
+for paths in copybooks.values():
+    if len(paths) < 2:
+        continue
+    generated = [p for p in paths
+                 if any(part.lower() in generated_dirs
+                        for part in os.path.relpath(os.path.dirname(p), source_root).split(os.sep))]
+    if len(paths) - len(generated) == 1:
+        for p in generated:
+            print(p)
+PYEOF
+    export REKT_SHADOWED_COPYBOOKS_FILE="$shadowed_copybooks_file"
+    if [[ -s "$shadowed_copybooks_file" ]]; then
+        echo -e "  ${BLUE}Generated copybooks replaced by a real copybook of the same name:${NC}"
+        local shadowed
+        while IFS= read -r shadowed; do
+            echo -e "    ${BLUE}↳ ${shadowed#"$REPO_ROOT/source/"}${NC}"
+        done < "$shadowed_copybooks_file"
+    fi
+
+    # Preprocess files that need IMS/DLI or dialect compatibility transformations
+    echo -e "${BLUE}  Running preprocessor for IMS/DLI and dialect compatibility...${NC}"
+    if [[ -x "$REPO_ROOT/tools/preprocess-for-rekt.sh" ]]; then
+        "$REPO_ROOT/tools/preprocess-for-rekt.sh" "$REPO_ROOT/source" 2>/dev/null
+        if [[ -d "$REPO_ROOT/source/.preprocessed" ]]; then
+            local preproc_count=0
+            local pp_p
+            for pp_p in cbl cob cpy; do
+                local hits
+                hits=$(find "$REPO_ROOT/source/.preprocessed" -maxdepth 1 \
+                    \( -name "*.${pp_p}" -o -name "*.$(echo $pp_p | tr 'a-z' 'A-Z')" \) 2>/dev/null | wc -l | tr -d ' ')
+                preproc_count=$((preproc_count + hits))
+            done
+            if [[ "$preproc_count" -gt 0 ]]; then
+                echo -e "  ${GREEN}✅ Preprocessed ${preproc_count} file(s) for rekt compatibility${NC}"
+            fi
+        fi
+    fi
+
+    local preprocessed_dir="$REPO_ROOT/source/.preprocessed"
+    local identity_check_output=""
+    if ! identity_check_output=$("$PYTHON_CMD" "$REPO_ROOT/tools/rekt_source_identity.py" \
+        "$REPO_ROOT/source" "$preprocessed_dir" "$shadowed_copybooks_file"); then
+        echo -e "${RED}❌ Source identity collisions prevent safe REKT staging.${NC}"
+        local -a _fields
+        while IFS=$'\t' read -r -a _fields; do
+            [[ ${#_fields[@]} -lt 2 ]] && continue
+            case "${_fields[0]}" in
+                copybook-collision)
+                    echo -e "  ${RED}copybook basename collision:${NC} ${_fields[1]}"
+                    echo -e "    ${YELLOW}REKT resolves COPY by name from one folder, and these copies differ.${NC}"
+                    ;;
+                copybook-collision-users)
+                    if [[ ${#_fields[@]} -gt 2 ]]; then
+                        echo -e "    ${YELLOW}named by:${NC} ${_fields[*]:2}"
+                    fi
+                    continue
+                    ;;
+                preprocessed-program-collision)
+                    echo -e "  ${RED}preprocessed program basename collision:${NC} ${_fields[1]}"
+                    echo -e "    ${YELLOW}preprocess-for-rekt.sh stages flat outputs for this basename, so the transformed source is ambiguous.${NC}"
+                    ;;
+                *) continue ;;
+            esac
+            local _path
+            for _path in "${_fields[@]:2}"; do
+                echo -e "    ${YELLOW}↳ ${_path}${NC}"
+            done
+        done <<< "$identity_check_output"
+        echo ""
+        echo "Rename one copy, or move the estate that is not being parsed out of source/."
+        return 1
+    fi
+
+    local _identical_dupes _unused_dupes
+    _identical_dupes=$(grep -c '^copybook-duplicate-identical' <<< "$identity_check_output" || true)
+    _unused_dupes=$(grep '^copybook-duplicate-unused' <<< "$identity_check_output" | cut -f2 | tr '\n' ' ' || true)
+    if [[ "$_identical_dupes" -gt 0 ]]; then
+        echo -e "  ${BLUE}ℹ️  ${_identical_dupes} copybook name(s) appear in several folders with the same text; one copy is staged.${NC}"
+    fi
+    if [[ -n "${_unused_dupes// /}" ]]; then
+        echo -e "  ${BLUE}ℹ️  Copybooks that differ but share a name, and that no COPY or INCLUDE uses, so the parse never reads them:${NC}"
+        echo -e "     ${_unused_dupes% }"
+    fi
+
+    local duplicate_program_basenames=""
+    while IFS=$'\t' read -r issue basename _paths; do
+        if [[ "$issue" == "program-duplicate" ]]; then
+            duplicate_program_basenames="$duplicate_program_basenames $basename"
+        fi
+    done <<< "$identity_check_output"
+
+    # Build a staging dir that preserves source-relative program identity.
+    # Copybooks remain flat at the root because smojol resolves COPY targets by basename.
+    # The container sees this as /source/.rekt-staging (bind-mounted from source/).
+    local staging_dir="$REPO_ROOT/source/.rekt-staging"
+    rm -rf "$staging_dir" 2>/dev/null || true
+    # A failed clean leaves the previous run staged, and the next parse then reports success
+    # while emitting a fraction of the artifacts. Refuse rather than degrade silently.
+    if [[ -d "$staging_dir" && -n "$(ls -A "$staging_dir" 2>/dev/null)" ]]; then
+        echo -e "${RED}❌ Could not clear $staging_dir${NC}"
+        echo ""
+        echo "Stale staging makes the parse emit far fewer artifacts than it reports."
+        echo "The container mounts /source read-only, so clear it from the host:"
+        echo "  rm -rf source/.rekt-staging"
+        return 1
+    fi
+    mkdir -p "$staging_dir"
+    local generated_stubs_file="$staging_dir/.generated-stubs"
+    : > "$generated_stubs_file"
+
+    stage_copybook_file() {
+        local src_file="$1"
+        local file_name
+        file_name="$(basename "$src_file")"
+        local target="$staging_dir/$file_name"
+        if [[ -f "$preprocessed_dir/$file_name" ]]; then
+            cp "$preprocessed_dir/$file_name" "$target" 2>/dev/null || true
+            if [[ -f "$preprocessed_dir/$file_name.preprocess.json" ]]; then
+                cp "$preprocessed_dir/$file_name.preprocess.json" "$target.preprocess.json" 2>/dev/null || true
+            fi
+        else
+            cp "$src_file" "$target" 2>/dev/null || true
+        fi
+        if [[ -f "$target" ]]; then
+            perl -0pi -e 's/MOVE ([01])\(1\)\s+TO/MOVE $1 TO/g' "$target" 2>/dev/null || true
+        fi
+    }
+
+    stage_program_file() {
+        local src_file="$1"
+        local file_name
+        file_name="$(basename "$src_file")"
+        local rel_path="${src_file#"$REPO_ROOT/source/"}"
+        local target="$staging_dir/$rel_path"
+        mkdir -p "$(dirname "$target")"
+        if [[ -f "$preprocessed_dir/$file_name" ]]; then
+            cp "$preprocessed_dir/$file_name" "$target" 2>/dev/null || true
+            if [[ -f "$preprocessed_dir/$file_name.preprocess.json" ]]; then
+                cp "$preprocessed_dir/$file_name.preprocess.json" "$target.preprocess.json" 2>/dev/null || true
+            fi
+        else
+            cp "$src_file" "$target" 2>/dev/null || true
+        fi
+        if [[ -f "$target" ]]; then
+            perl -0pi -e 's/MOVE ([01])\(1\)\s+TO/MOVE $1 TO/g' "$target" 2>/dev/null || true
+        fi
+    }
+
+    # Collect all copybooks (recursive) into the flat staging root.
+    while IFS= read -r cpyfile; do
+        grep -qxF "$cpyfile" "$shadowed_copybooks_file" && continue
+        stage_copybook_file "$cpyfile"
+    done < <(find "$REPO_ROOT/source" \( -name "*.cpy" -o -name "*.CPY" \) \
+        ! -path "*/.rekt-staging/*" \
+        ! -path "*/.preprocessed/*")
+
+    # Stage eight-character aliases before stubs. They are copies of real copybooks under a
+    # shortened name, so recording them as generated stubs would mark every program using a
+    # long copybook name as stub-backed and degrade its reported fidelity.
+    if [[ -d "$preprocessed_dir/aliases" ]]; then
+        while IFS= read -r alias_cpy; do
+            local alias_name
+            alias_name="$(basename "$alias_cpy")"
+            local alias_target="$staging_dir/$alias_name"
+            [[ -f "$alias_target" ]] || cp "$alias_cpy" "$alias_target" 2>/dev/null || true
+        done < <(find "$preprocessed_dir/aliases" -maxdepth 1 \( -name "*.cpy" -o -name "*.CPY" \) -type f 2>/dev/null)
+    fi
+
+    # Stage the remaining preprocessed copybooks after real copybooks without overwriting them.
+    #
+    # .preprocessed/ holds three kinds of file: rewritten copies of real source copybooks,
+    # bundled system copybooks such as SQLCA, and synthesised stubs. Only the last kind
+    # degrades a program's fidelity, and only the last kind carries the generator's marker.
+    # Recording by directory instead of by marker reported real content as invented, which
+    # downgraded every program reaching a bundled copybook to StubBacked.
+    if [[ -d "$preprocessed_dir" ]]; then
+        while IFS= read -r stub_cpy; do
+            local stub_name
+            stub_name="$(basename "$stub_cpy")"
+            local stub_target="$staging_dir/$stub_name"
+            # Don't overwrite a real copybook that was already staged
+            if [[ ! -f "$stub_target" ]]; then
+                cp "$stub_cpy" "$stub_target" 2>/dev/null || true
+                if grep -qF "$REKT_STUB_MARKER" "$stub_cpy" 2>/dev/null; then
+                    printf '%s\n' "${stub_name%.*}" | tr '[:lower:]' '[:upper:]' >> "$generated_stubs_file"
+                fi
+                if [[ -f "$stub_cpy.preprocess.json" ]]; then
+                    cp "$stub_cpy.preprocess.json" "$stub_target.preprocess.json" 2>/dev/null || true
+                fi
+            fi
+        done < <(find "$preprocessed_dir" -maxdepth 1 \( -name "*.cpy" -o -name "*.CPY" \) -type f 2>/dev/null)
+    fi
+
+    # Collect all COBOL programs (recursive) while preserving their source-relative path.
+    while IFS= read -r cblfile; do
+        stage_program_file "$cblfile"
+    done < <(find "$REPO_ROOT/source" \( -name "*.cbl" -o -name "*.CBL" -o -name "*.cob" -o -name "*.COB" \) \
+        ! -path "*/.rekt-staging/*" \
+        ! -path "*/.preprocessed/*")
+
+    local staged_cbl staged_cpy
+    staged_cbl=$(find "$staging_dir" -type f \( -name "*.cbl" -o -name "*.CBL" -o -name "*.cob" -o -name "*.COB" \) | wc -l | tr -d ' ')
+    staged_cpy=$(find "$staging_dir" -type f \( -name "*.cpy" -o -name "*.CPY" \) | wc -l | tr -d ' ')
+    echo -e "  ${BLUE}Staged: ${staged_cbl} program(s), ${staged_cpy} copybook(s) → source/.rekt-staging/${NC}"
+
+    # Restart stale Docker Desktop bind mounts before they produce empty parser output.
+    if [[ "$staged_cbl" -gt 0 ]]; then
+        local container_visible
+        container_visible=$(container_exec "$REKT_CONTAINER" sh -c "ls /source/.rekt-staging 2>/dev/null | wc -l" 2>/dev/null | tr -d ' ')
+        if [[ -z "$container_visible" || "$container_visible" -eq 0 ]]; then
+            echo -e "  ${YELLOW}⚠️  Container can't see /source/.rekt-staging — bind mount is stale. Restarting $REKT_CONTAINER…${NC}"
+            run_compose restart "$REKT_SERVICE" >/dev/null 2>&1 || true
+            sleep 3
+            container_visible=$(container_exec "$REKT_CONTAINER" sh -c "ls /source/.rekt-staging 2>/dev/null | wc -l" 2>/dev/null | tr -d ' ')
+            if [[ -z "$container_visible" || "$container_visible" -eq 0 ]]; then
+                echo -e "  ${RED}❌ Container still can't see staging files after restart.${NC}"
+                echo -e "     Try: ${BLUE}docker compose down && docker compose up -d${NC} from the repo root."
+                return 1
+            fi
+            echo -e "  ${GREEN}✅ Container now sees ${container_visible} staged file(s).${NC}"
+        fi
+    fi
+
+    # Clear previous run outputs first so the missing-copybook report below survives.
+    # Use find-delete rather than rm -rf dir to preserve the Docker bind mount (./output/rekt:/output).
+    # A filtered run clears only its own programs once the filter resolves; the graph ingest
+    # reads everything here, so a full wipe would drop every other program from the estate.
+    mkdir -p "$REPO_ROOT/output/rekt"
+    if [[ -z "${_REKT_PROGRAM_FILTER:-}" ]]; then
+        find "$REPO_ROOT/output/rekt" -mindepth 1 -delete 2>/dev/null || true
+    fi
+
+    # Report missing copybooks before parsing so reduced coverage is explicit.
+    local missing_report="$REPO_ROOT/output/rekt/missing-copybooks.txt"
+    mkdir -p "$REPO_ROOT/output/rekt"
+    "$PYTHON_CMD" - "$staging_dir" "$missing_report" "$generated_stubs_file" >/dev/null 2>&1 <<'PYEOF' || true
+import os, re, sys
+from collections import defaultdict
+
+staging_dir = sys.argv[1]
+report_path = sys.argv[2]
+stubs_path = sys.argv[3] if len(sys.argv) > 3 else ''
+
+# Names that exist in staging only because a placeholder was synthesised for them. Staging
+# happens before this scan, so treating the staged file as evidence of availability would
+# report a copybook as present precisely because it was missing.
+synthesised = set()
+if stubs_path and os.path.exists(stubs_path):
+    with open(stubs_path, encoding='utf-8') as handle:
+        synthesised = {line.strip().upper() for line in handle if line.strip()}
+
+# Available copybook stems (case-insensitive), as staged
+available = set()
+for root, _, files in os.walk(staging_dir):
+    for name in files:
+        stem, ext = os.path.splitext(name)
+        if ext.lower() == '.cpy':
+            available.add(stem.upper())
+available -= synthesised
+
+# Match COPY / -COPY directives in non-comment lines.
+# Handles: COPY NAME., COPY 'NAME'., COPY NAME REPLACING ...
+copy_pat = re.compile(
+    r"^[^*]{0,6}[^*\n].*?\bCOPY\s+['\"]?([A-Z][A-Z0-9_-]*)['\"]?",
+    re.IGNORECASE,
+)
+
+referenced_by = defaultdict(set)  # copybook_name → set(referencing_files)
+staged_sources = []
+for root, _, files in os.walk(staging_dir):
+    for name in files:
+        if name.lower().endswith(('.cbl', '.cob', '.cpy')):
+            path = os.path.join(root, name)
+            rel = os.path.relpath(path, staging_dir).replace(os.sep, '/')
+            staged_sources.append((rel, path))
+
+for rel_name, path in sorted(staged_sources):
+    try:
+        with open(path, 'r', encoding='latin-1') as f:
+            for line in f:
+                # Skip comments (col 7 = '*') and lines too short
+                if len(line) > 6 and line[6] == '*':
+                    continue
+                m = copy_pat.match(line.rstrip())
+                if m:
+                    cpy = m.group(1).upper()
+                    if cpy not in available:
+                        referenced_by[cpy].add(rel_name)
+    except OSError:
+        continue
+
+if not referenced_by:
+    # Truncate the report so stale entries don't linger.
+    open(report_path, 'w').close()
+    sys.exit(0)
+
+with open(report_path, 'w', encoding='utf-8') as out:
+    out.write('# Missing copybooks referenced by staged sources\n')
+    out.write('# These COPY targets were not found in source/. The parser will\n')
+    out.write('# still attempt the file but may emit MISSING_COPYBOOK errors and\n')
+    out.write('# produce reduced AST/data coverage for affected programs.\n\n')
+    for cpy in sorted(referenced_by):
+        refs = ', '.join(sorted(referenced_by[cpy]))
+        out.write(f'{cpy}\treferenced by: {refs}\n')
+
+# Stdout: short, colorized-friendly summary (no ANSI here; caller decorates)
+total = len(referenced_by)
+unique_files = set()
+for refs in referenced_by.values():
+    unique_files.update(refs)
+print(f'{total}|{len(unique_files)}')
+for cpy in sorted(referenced_by):
+    print(f'  {cpy} ← {", ".join(sorted(referenced_by[cpy]))}')
+PYEOF
+
+    if [[ -s "$missing_report" ]]; then
+        local miss_summary
+        miss_summary=$("$PYTHON_CMD" -c "
+import sys
+with open(sys.argv[1]) as f:
+    lines = [l.rstrip() for l in f if l.strip() and not l.startswith('#')]
+print(len(lines))
+" "$missing_report" 2>/dev/null || echo 0)
+        if [[ "$miss_summary" -gt 0 ]]; then
+            echo -e "  ${YELLOW}⚠️  Missing copybooks: ${miss_summary} unresolved COPY target(s)${NC}"
+            # Show the first few inline for quick scanning
+            local first_lines
+            first_lines=$(grep -v '^#' "$missing_report" | head -5)
+            while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                echo -e "    ${YELLOW}↳ ${line}${NC}"
+            done <<< "$first_lines"
+            if [[ "$miss_summary" -gt 5 ]]; then
+                echo -e "    ${YELLOW}↳ … and $((miss_summary - 5)) more — see output/rekt/missing-copybooks.txt${NC}"
+            fi
+            echo -e "    ${YELLOW}Provide these in source/ for full AST coverage; the scan will continue.${NC}"
+        fi
+    fi
+
+    # Fall back through parser modes for dialect and source-format incompatibilities.
+    local succeeded=0
+    local failed=0
+    local skipped=0
+    local filtered_out=0
+    local failed_files=""
+
+    # Resolve the optional program filter to exact source-relative program paths.
+    local rekt_filter_file=""
+    local rekt_filter_active=false
+    if [[ -n "${_REKT_PROGRAM_FILTER:-}" ]]; then
+        rekt_filter_active=true
+        local filter_resolution_output=""
+        if ! filter_resolution_output=$("$PYTHON_CMD" - "$staging_dir" "$_REKT_PROGRAM_FILTER" <<'PYEOF'
+import os, sys
+from collections import defaultdict
+
+staging_dir = sys.argv[1]
+selectors = sys.argv[2]
+programs = []
+for root, _, files in os.walk(staging_dir):
+    for name in files:
+        if name.lower().endswith(('.cbl', '.cob')):
+            path = os.path.join(root, name)
+            rel = os.path.relpath(path, staging_dir).replace(os.sep, '/')
+            programs.append(rel)
+
+exact = {p.lower(): p for p in programs}
+by_basename = defaultdict(list)
+by_stem = defaultdict(list)
+for rel in programs:
+    basename = os.path.basename(rel)
+    by_basename[basename.lower()].append(rel)
+    by_stem[os.path.splitext(basename)[0].lower()].append(rel)
+
+resolved = []
+for raw in selectors.split(','):
+    selector = raw.strip()
+    if not selector:
+        continue
+    normalized = selector.replace('\\', '/').lstrip('./').lstrip('/')
+    match = exact.get(normalized.lower())
+    if match:
+        if match not in resolved:
+            resolved.append(match)
+        continue
+
+    basename_matches = by_basename.get(os.path.basename(normalized).lower(), [])
+    if len(basename_matches) == 1:
+        match = basename_matches[0]
+        if match not in resolved:
+            resolved.append(match)
+        continue
+    if len(basename_matches) > 1:
+        print(
+            "Program selector '%s' matched multiple staged programs by basename: %s. Use a source-relative path."
+            % (selector, ", ".join(sorted(basename_matches)))
+        )
+        sys.exit(1)
+
+    stem_matches = by_stem.get(os.path.splitext(os.path.basename(normalized))[0].lower(), [])
+    if len(stem_matches) == 1:
+        match = stem_matches[0]
+        if match not in resolved:
+            resolved.append(match)
+        continue
+    if len(stem_matches) > 1:
+        print(
+            "Program selector '%s' matched multiple staged programs by stem: %s. Use a source-relative path."
+            % (selector, ", ".join(sorted(stem_matches)))
+        )
+        sys.exit(1)
+
+    print("Program selector '%s' did not match any staged program." % selector)
+    sys.exit(1)
+
+if not resolved:
+    print("Program filter did not resolve to any staged programs.")
+    sys.exit(1)
+
+print("\n".join(resolved))
+PYEOF
+); then
+            echo -e "${RED}❌ Invalid _REKT_PROGRAM_FILTER.${NC}"
+            while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                echo -e "    ${YELLOW}↳ ${line}${NC}"
+            done <<< "$filter_resolution_output"
+            return 1
+        fi
+        rekt_filter_file="$staging_dir/.rekt-program-filter"
+        printf '%s\n' "$filter_resolution_output" > "$rekt_filter_file"
+        local filtered_rel
+        while IFS= read -r filtered_rel; do
+            [[ -z "$filtered_rel" ]] && continue
+            rm -rf "$REPO_ROOT/output/rekt/${filtered_rel}.report"
+            rm -f "$REPO_ROOT/output/rekt/${filtered_rel}.parse.log" \
+                "$REPO_ROOT/output/rekt/${filtered_rel}-deps.json" \
+                "$REPO_ROOT/output/rekt/${filtered_rel}.facts.json"
+        done < "$rekt_filter_file"
+        echo -e "  ${BLUE}REKT program filter: ${_REKT_PROGRAM_FILTER}${NC}"
+    fi
+
+    # Incremental scanning is opt-in to preserve full-scan behavior by default.
+    local rekt_inc=false
+    [[ "${_REKT_INCREMENTAL:-false}" == "true" ]] && rekt_inc=true
+    if [[ "$rekt_inc" == "true" && -n "$duplicate_program_basenames" ]]; then
+        echo -e "${RED}❌ _REKT_INCREMENTAL requires unique program basenames.${NC}"
+        while IFS=$'\t' read -r issue basename path1 rest; do
+            [[ "$issue" != "program-duplicate" ]] && continue
+            echo -e "  ${RED}${basename}${NC}"
+            local _path
+            for _path in "$path1" $rest; do
+                [[ -z "$_path" ]] && continue
+                echo -e "    ${YELLOW}↳ ${_path}${NC}"
+            done
+        done <<< "$identity_check_output"
+        echo -e "  ${YELLOW}Disable _REKT_INCREMENTAL or disambiguate these basenames before rerunning.${NC}"
+        return 1
+    fi
+
+    declare rekt_skip_set=""
+    local rekt_manifest=""
+    # The outcome is measured for every program on every run. Recording it unconditionally is
+    # what lets the portal report the fidelity the parser observed instead of inferring it
+    # from which directories happen to exist.
+    if command -v dotnet >/dev/null 2>&1 && [[ -f "$REPO_ROOT/CobolToQuarkusMigration.csproj" ]]; then
+        rekt_manifest=$(mktemp -t rekt-scan-manifest.XXXXXX)
+    fi
+    if [[ "$rekt_inc" == "true" ]]; then
+        if command -v dotnet >/dev/null 2>&1 && [[ -f "$REPO_ROOT/CobolToQuarkusMigration.csproj" ]]; then
+            local rekt_db="${_REKT_SCAN_DB:-$REPO_ROOT/Data/rekt-scan.db}"
+            local rekt_plan_file
+            rekt_plan_file=$(mktemp -t rekt-scan-plan.XXXXXX)
+            echo -e "  ${BLUE}Incremental REKT cache: planning…${NC}"
+            # Forward the filter so the planner only considers targeted programs.
+            local _plan_programs_arg=()
+            if [[ "$rekt_filter_active" == "true" ]]; then
+                local incremental_program_filter=""
+                while IFS= read -r filtered_program; do
+                    [[ -z "$filtered_program" ]] && continue
+                    local filtered_basename
+                    filtered_basename="$(basename "$filtered_program")"
+                    incremental_program_filter="${incremental_program_filter:+$incremental_program_filter,}$filtered_basename"
+                done < "$rekt_filter_file"
+                _plan_programs_arg=(--programs "$incremental_program_filter")
+            fi
+            if (cd "$REPO_ROOT" && dotnet run --project CobolToQuarkusMigration.csproj --no-build -- \
+                    rekt-scan-cache plan "$staging_dir" \
+                    --db "$rekt_db" \
+                    --verify-artifacts-in "$REPO_ROOT/output/rekt" \
+                    "${_plan_programs_arg[@]}" \
+                    > "$rekt_plan_file" 2>/dev/null); then
+                local _skip_count=0 _parse_count=0
+                while IFS=$'\t' read -r action basename reason; do
+                    [[ -z "$action" ]] && continue
+                    if [[ "$action" == "skip" ]]; then
+                        rekt_skip_set="$rekt_skip_set $basename"
+                        _skip_count=$((_skip_count + 1))
+                    else
+                        _parse_count=$((_parse_count + 1))
+                    fi
+                done < "$rekt_plan_file"
+                echo -e "  ${BLUE}Incremental plan: ${_parse_count} to parse, ${_skip_count} cached.${NC}"
+            else
+                echo -e "  ${YELLOW}⚠️  Incremental plan failed — falling back to full scan.${NC}"
+                rekt_inc=false
+            fi
+            rm -f "$rekt_plan_file"
+        else
+            echo -e "  ${YELLOW}⚠️  _REKT_INCREMENTAL=true but dotnet/project not available — full scan.${NC}"
+            rekt_inc=false
+        fi
+    fi
+
+    # smojol resolves a program by filename and searches --srcDir recursively, so a
+    # source-relative path never matches and every nested program is reported missing.
+    # It is invoked by basename and its output is moved back to the nested layout, which
+    # the artifact locators and the v2-source-relative identity scheme depend on.
+    relocate_rekt_report() {
+        local flat_name="$1" nested_rel="$2"
+        [[ "$flat_name" == "$nested_rel" ]] && return 0
+
+        local out_root="$REPO_ROOT/output/rekt"
+        local flat_path="$out_root/${flat_name}.report"
+        local nested_path="$out_root/${nested_rel}.report"
+        [[ -d "$flat_path" ]] || return 0
+
+        mkdir -p "$(dirname "$nested_path")"
+        rm -rf "$nested_path"
+        mv "$flat_path" "$nested_path"
+    }
+
+    # smojol can exit 0 without writing the AST or control flow, so its exit code alone
+    # would report a program as fully parsed when consumers will find no structure for it.
+    rekt_structure_written() {
+        local report="$REPO_ROOT/output/rekt/${1}.report"
+        compgen -G "$report/flow_ast/*.json" >/dev/null && compgen -G "$report/cfg/*.json" >/dev/null
+    }
+
+    # Use process substitution so succeeded/failed counters persist outside the loop
+    while IFS= read -r cbl_file; do
+        [[ -e "$cbl_file" ]] || continue
+        local fname
+        fname=$(basename "$cbl_file")
+        local rel_program="${cbl_file#"$staging_dir"/}"
+        # Strip any recognised program extension (case-insensitive) to get the stem.
+        local stem="${fname%.*}"
+        local rel_log_path="${rel_program}.parse.log"
+        local err_log="$REPO_ROOT/output/rekt/$rel_log_path"
+        mkdir -p "$(dirname "$err_log")"
+
+        # Skip files outside the requested program filter.
+        if [[ "$rekt_filter_active" == "true" ]] && ! grep -Fqx "$rel_program" "$rekt_filter_file"; then
+            filtered_out=$((filtered_out + 1))
+            continue
+        fi
+
+        # Honor the incremental planner's skip decision.
+        if [[ "$rekt_inc" == "true" ]] && [[ " $rekt_skip_set " == *" $fname "* ]]; then
+            echo -e "  Skipping $rel_program ${GREEN}(cached)${NC}"
+            succeeded=$((succeeded + 1))
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        local rel_output_dir="$REPO_ROOT/output/rekt/$(dirname "$rel_program")"
+        mkdir -p "$rel_output_dir"
+        echo -ne "  Parsing $rel_program..."
+        local parse_outcome="Failed"
+        local stub_warnings=""
+        if [[ -s "$generated_stubs_file" ]]; then
+            stub_warnings=$("$PYTHON_CMD" - "$cbl_file" "$generated_stubs_file" <<'PYEOF'
+import re
+import sys
+
+source_path, stubs_path = sys.argv[1:3]
+with open(stubs_path, encoding="utf-8") as handle:
+    stubs = {line.strip().upper() for line in handle if line.strip()}
+
+copy_pattern = re.compile(
+    r"\bCOPY\s+['\"]?([A-Z][A-Z0-9_-]*)['\"]?",
+    re.IGNORECASE,
+)
+used = set()
+with open(source_path, encoding="latin-1") as handle:
+    for line in handle:
+        stripped = line.lstrip()
+        if stripped.startswith("*>") or (len(line) > 6 and line[6] in ("*", "/")):
+            continue
+        match = copy_pattern.search(line)
+        if match and match.group(1).upper() in stubs:
+            used.add(match.group(1).upper())
+
+print("|".join(f"generated-copybook-stub:{name}" for name in sorted(used)))
+PYEOF
+)
+        fi
+
+        # Attempt 1: Standard dialect (handles CICS, SQL, standard COBOL)
+        if container_exec "$REKT_CONTAINER" java -jar /app/smojol-cli.jar run "$fname" \
+            --commands="BUILD_BASE_ANALYSIS WRITE_FLOW_AST WRITE_CFG WRITE_DATA_STRUCTURES" \
+            --srcDir=/source/.rekt-staging --copyBooksDir=/source/.rekt-staging \
+            --dialectJarPath=/app/dialect-idms.jar \
+            --reportDir=/output \
+            --generation=PROGRAM >/dev/null 2>"$err_log" && rekt_structure_written "$fname"; then
+            echo -e " ${GREEN}✅${NC}"
+            rm -f "$err_log"
+            succeeded=$((succeeded + 1))
+            parse_outcome="Full"
+        else
+            # Attempt 2: Retry without dialect JAR (for IMS/DL/I and other dialects)
+            if container_exec "$REKT_CONTAINER" java -jar /app/smojol-cli.jar run "$fname" \
+                --commands="BUILD_BASE_ANALYSIS WRITE_FLOW_AST WRITE_CFG WRITE_DATA_STRUCTURES" \
+                --srcDir=/source/.rekt-staging --copyBooksDir=/source/.rekt-staging \
+                --reportDir=/output \
+                --generation=PROGRAM >/dev/null 2>>"$err_log" && rekt_structure_written "$fname"; then
+                echo -e " ${GREEN}✅${NC} (no-dialect mode)"
+                rm -f "$err_log"
+                succeeded=$((succeeded + 1))
+                parse_outcome="NoDialect"
+            else
+                # Attempt 3: Raw AST only (tolerates more parse errors)
+                if container_exec "$REKT_CONTAINER" java -jar /app/smojol-cli.jar run "$fname" \
+                    --commands="WRITE_RAW_AST" \
+                    --srcDir=/source/.rekt-staging --copyBooksDir=/source/.rekt-staging \
+                    --reportDir=/output \
+                    --generation=PROGRAM >/dev/null 2>>"$err_log"; then
+                    echo -e " ${YELLOW}⚠️${NC} (raw AST only — complex copybooks)"
+                    rm -f "$err_log"
+                    succeeded=$((succeeded + 1))
+                    parse_outcome="RawAst"
+                else
+                    # Dependency extraction can remain useful when AST writing fails.
+                    local dep_ok=false
+                    if container_exec "$REKT_CONTAINER" java -jar /app/smojol-cli.jar dependency "$fname" \
+                        --srcDir=/source/.rekt-staging --copyBooksDir=/source/.rekt-staging \
+                        --dialectJarPath=/app/dialect-idms.jar \
+                        --export=/output/"${rel_program}"-deps.json >/dev/null 2>>"$err_log"; then
+                        dep_ok=true
+                    fi
+                    # Also try validate (may report warnings but still useful)
+                    container_exec "$REKT_CONTAINER" java -jar /app/smojol-cli.jar validate "$fname" \
+                        --srcDir=/source/.rekt-staging --copyBooksDir=/source/.rekt-staging \
+                        --dialectJarPath=/app/dialect-idms.jar >/dev/null 2>>"$err_log" || true
+
+                    if [[ "$dep_ok" == true ]]; then
+                        echo -e " ${YELLOW}⚠️${NC} (deps only — AST writer bug)"
+                        # Show smojol error hint. Prefer "Caused by:" (root cause); fall back to first match.
+                        # Full log available at output/rekt/<source-relative>.parse.log
+                        local err_hint
+                        err_hint=$(grep -Eo '(Exception|Error|Caused by): .{1,120}' "$err_log" 2>/dev/null \
+                            | grep -i 'caused by' | head -1)
+                        [[ -z "$err_hint" ]] && \
+                            err_hint=$(grep -Eo '(Exception|Error|Caused by): .{1,120}' "$err_log" 2>/dev/null | head -1)
+                        [[ -n "$err_hint" ]] && echo -e "    ${YELLOW}↳ smojol: $err_hint${NC}"
+                        echo -e "    ${YELLOW}↳ log: output/rekt/${rel_log_path}${NC}"
+                        succeeded=$((succeeded + 1))
+                        parse_outcome="DepsOnly"
+                    else
+                        echo -e " ${RED}❌${NC}"
+                        echo -e "    ${RED}↳ log: output/rekt/${rel_log_path}${NC}"
+                        failed=$((failed + 1))
+                        failed_files="${failed_files} ${rel_program}"
+                        parse_outcome="Failed"
+                    fi
+                fi
+            fi
+        fi
+
+        # Relocated per program rather than after the loop, so two programs sharing a
+        # basename cannot overwrite each other's flat report.
+        relocate_rekt_report "$fname" "$rel_program"
+
+        if [[ -n "$stub_warnings" ]]; then
+            if [[ "$parse_outcome" == "Full" || "$parse_outcome" == "NoDialect" ]]; then
+                parse_outcome="StubBacked"
+            fi
+            echo -e "    ${YELLOW}↳ generated copybook stub used; structural facts are degraded${NC}"
+        fi
+
+        # Append outcomes for batch recording after the loop.
+        if [[ -n "$rekt_manifest" ]]; then
+            printf '%s\t%s\t%s\n' "$fname" "$parse_outcome" "$stub_warnings" >> "$rekt_manifest"
+        fi
+    done < <(find "$staging_dir" -type f \( -name "*.cbl" -o -name "*.CBL" -o -name "*.cob" -o -name "*.COB" \) | sort)
+
+    # Persist outcomes in one dotnet invocation.
+    if [[ -n "$rekt_manifest" && -s "$rekt_manifest" ]]; then
+        local rekt_db="${_REKT_SCAN_DB:-$REPO_ROOT/Data/rekt-scan.db}"
+        # The cache is keyed by basename, so duplicates would overwrite each other. The portal
+        # already refuses to trust an entry whose basename is ambiguous, so recording is safe.
+        (cd "$REPO_ROOT" && dotnet run --project CobolToQuarkusMigration.csproj --no-build -- \
+                rekt-scan-cache record-batch "$rekt_manifest" \
+                --staging-dir "$staging_dir" \
+                --db "$rekt_db" >/dev/null 2>&1) && \
+            echo -e "  ${GREEN}✅ Parse outcomes recorded to $(basename "$rekt_db")${NC}" || \
+            echo -e "  ${YELLOW}⚠️  Could not record parse outcomes; fidelity falls back to artifacts.${NC}"
+        rm -f "$rekt_manifest"
+    fi
+
+    # Extract facts while staged source bytes remain available; dependency discovery reads them,
+    # so this is on unless _PROGRAM_FACTS=false. Failures are non-fatal.
+    if [[ "${_PROGRAM_FACTS:-true}" == "true" && "$succeeded" -gt 0 ]]; then
+        if command -v dotnet >/dev/null 2>&1 && [[ -f "$REPO_ROOT/CobolToQuarkusMigration.csproj" ]]; then
+            local pf_db="${_REKT_SCAN_DB:-$REPO_ROOT/Data/rekt-scan.db}"
+            echo -e "  ${BLUE}Extracting program-facts.json …${NC}"
+            local pf_extract_args=(
+                program-facts extract "$staging_dir"
+                --rekt-dir "$REPO_ROOT/output/rekt"
+                --output-dir "$REPO_ROOT/output/rekt"
+                --repo-root "$REPO_ROOT"
+            )
+            # Forward the scan-cache DB only when it exists; the extractor
+            # uses it for confidence inference but treats it as optional.
+            [[ -f "$pf_db" ]] && pf_extract_args+=(--scan-cache-db "$pf_db")
+            # Limit fact extraction to programs included in partial runs.
+            if [[ "$rekt_filter_active" == "true" ]]; then
+                pf_extract_args+=(--programs "$_REKT_PROGRAM_FILTER")
+            fi
+            if (cd "$REPO_ROOT" && dotnet run --project CobolToQuarkusMigration.csproj --no-build -- \
+                    "${pf_extract_args[@]}" 2>/dev/null); then
+                : # success summary already printed to stderr by the CLI
+            else
+                echo -e "  ${YELLOW}⚠️  program-facts extract failed — facts not refreshed (this run continues uncached for facts).${NC}"
+            fi
+
+            # Prune orphans only when explicitly requested.
+            if [[ "${_PROGRAM_FACTS_PRUNE_ORPHANS:-false}" == "true" ]]; then
+                (cd "$REPO_ROOT" && dotnet run --project CobolToQuarkusMigration.csproj --no-build -- \
+                        program-facts prune-orphans "$REPO_ROOT/output/rekt" \
+                        --staging-dir "$staging_dir" 2>/dev/null) || true
+            fi
+        else
+            echo -e "  ${YELLOW}⚠️  dotnet/project not available — program facts not extracted.${NC}"
+        fi
+    fi
+
+    # Clean up staging dir — it lives inside source/ which is gitignored
+    rm -rf "$staging_dir"
+    rm -f "$shadowed_copybooks_file"
+
+    # JCL is parsed deterministically from source/, without REKT; failures are non-fatal.
+    if command -v dotnet >/dev/null 2>&1 && [[ -f "$REPO_ROOT/CobolToQuarkusMigration.csproj" ]]; then
+        (cd "$REPO_ROOT" && dotnet run --project CobolToQuarkusMigration.csproj --no-build -- \
+                jcl-facts "$REPO_ROOT/source" --output-dir "$REPO_ROOT/output/rekt") || \
+            echo -e "  ${YELLOW}⚠️  jcl-facts failed — JCL job facts not refreshed.${NC}"
+    fi
+
+    echo -e "\n${GREEN}  Parsed: $succeeded succeeded ($skipped from cache), $failed failed${NC}"
+    if [[ "$rekt_filter_active" == "true" && "$filtered_out" -gt 0 ]]; then
+        echo -e "  ${BLUE}Filter active: $filtered_out program(s) outside _REKT_PROGRAM_FILTER were skipped.${NC}"
+    fi
+    # Count degraded outputs (succeeded with warnings — deps-only or raw-AST fallbacks).
+    local degraded
+    degraded=$(find "$REPO_ROOT/output/rekt" -name '*.parse.log' 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$degraded" -gt 0 ]]; then
+        echo -e "${YELLOW}  ⚠️  ${degraded} program(s) parsed with reduced fidelity (deps-only / raw-AST fallback).${NC}"
+        echo -e "${YELLOW}      These usually mean missing copybooks or smojol parser limitations.${NC}"
+        echo -e "${YELLOW}      Inspect: output/rekt/**/*.parse.log${NC}"
+    fi
+    if [[ -s "$missing_report" ]]; then
+        local miss_count
+        miss_count=$(grep -cv '^#' "$missing_report" 2>/dev/null | tr -d ' ')
+        # grep -cv may count blank lines; recompute strictly
+        miss_count=$(grep -v '^#' "$missing_report" | grep -c .)
+        if [[ "$miss_count" -gt 0 ]]; then
+            echo -e "${YELLOW}  ⚠️  ${miss_count} missing copybook(s) — see output/rekt/missing-copybooks.txt${NC}"
+        fi
+    fi
+    if [[ -n "$failed_files" ]]; then
+        echo -e "${YELLOW}  Failed files:${failed_files}${NC}"
+        echo -e "${YELLOW}  These may use IMS/DL/I EXEC DLI, non-standard column formats,${NC}"
+        echo -e "${YELLOW}  or reference missing copybooks. Check with: grep 'EXEC DLI' source/<file>${NC}"
+    fi
+    echo -e "${BLUE}  Output: output/rekt/${NC}"
+}
+
+run_rekt_ingest() {
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║   Graph Populator: Ingest into Neo4j                        ║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+
+    detect_docker_api_version
+    ensure_rekt_containers || return 1
+
+    local db_path
+    db_path="$(get_migration_db_path)"
+    local sqlite_args=()
+    if [[ -f "$db_path" ]]; then
+        echo -e "${BLUE}  SQLite DB found: $db_path — will migrate existing data${NC}"
+        sqlite_args=(--sqlite-db "$db_path")
+    fi
+
+    # Use date-based run ID (YYYYMMDDhhmm) — readable and unique per minute
+    local run_id
+    run_id=$(date +%Y%m%d%H%M)
+    echo -e "${BLUE}  Scan Run ID: ${GREEN}${run_id}${NC}"
+
+    echo -e "${BLUE}  Ingesting into $NEO4J_CONTAINER (bolt://localhost:$NEO4J_BOLT_PORT)${NC}"
+
+    # Use the local Python environment so ingestion does not depend on a
+    # separately running graph-populator container.
+    local populator_dir="$REPO_ROOT/tools/graph-populator"
+    ensure_graph_populator_environment || return 1
+    if ! (cd "$populator_dir" && "$(graph_populator_python)" populator.py ingest \
+        --source-dir "$REPO_ROOT/source" \
+        --rekt-output "$REPO_ROOT/output/rekt" \
+        --run-id "$run_id" \
+        "${sqlite_args[@]}"); then
+        echo -e "\n${RED}❌ Ingest failed — the graph was not updated.${NC}"
+        return 1
+    fi
+
+    # A populator that exits clean having written nothing is indistinguishable from success
+    # at the console, and the portal then reports an empty estate as a finding.
+    local ingested
+    ingested=$(container_exec "$NEO4J_CONTAINER" cypher-shell -u neo4j \
+        -p "$NEO4J_PASSWORD" --format plain \
+        "MATCH (n) WHERE n.runId = $run_id RETURN count(n)" 2>/dev/null | tail -1 | tr -d '[:space:]')
+
+    if [[ -z "$ingested" || "$ingested" == "0" ]]; then
+        echo -e "\n${RED}❌ Ingest reported success but run ${run_id} has no nodes in the graph.${NC}"
+        echo -e "${YELLOW}  Check that output/rekt contains parsed artifacts:${NC}  ./doctor.sh rekt-status"
+        return 1
+    fi
+
+    # Node count alone passes on the CobolFile rows the scan always writes, so compare against
+    # the artifacts on disk: reports present with no AST ingested means the run lost its output.
+    local report_dirs
+    report_dirs=$(find "$REPO_ROOT/output/rekt" -name '*.report' -type d 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$report_dirs" -gt 0 ]]; then
+        local ast_files
+        ast_files=$(container_exec "$NEO4J_CONTAINER" cypher-shell -u neo4j \
+            -p "$NEO4J_PASSWORD" --format plain \
+            "MATCH (:CobolFile {runId: $run_id})-[:HAS_AST]->() RETURN count(*)" \
+            2>/dev/null | tail -1 | tr -d '[:space:]')
+        if [[ -z "$ast_files" || "$ast_files" == "0" ]]; then
+            echo -e "\n${RED}❌ ${report_dirs} report director(ies) on disk but no AST reached the graph.${NC}"
+            echo -e "${YELLOW}  Clear stale staging and re-parse:${NC}  rm -rf source/.rekt-staging && ./doctor.sh rekt-full"
+            return 1
+        fi
+        echo -e "  ${GREEN}✅ ${ast_files} program AST(s) linked in the graph${NC}"
+    fi
+    echo -e "  ${GREEN}✅ ${ingested} node(s) ingested for run ${run_id}${NC}"
+
+    echo -e "\n${GREEN}  Neo4j Browser: http://localhost:$NEO4J_HTTP_PORT${NC}"
+    echo -e "${GREEN}  Connection URL: neo4j://localhost:$NEO4J_BOLT_PORT${NC}"
+    echo -e "${GREEN}  Scan Run ID: ${run_id}${NC}"
+}
+
+run_rekt_full() {
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║   Cobol-REKT Full Pipeline: Parse → Ingest                ║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+
+    run_rekt_parse || return 1
+    run_rekt_ingest || return 1
+
+    echo -e "\n${GREEN}✅ rekt pipeline complete.${NC}"
+    echo -e "${BLUE}  Neo4j Browser: http://localhost:$NEO4J_HTTP_PORT${NC}"
+    echo -e "${BLUE}  Connection URL: neo4j://localhost:$NEO4J_BOLT_PORT${NC}"
+    echo -e "${YELLOW}  Next: the portal needs a migration run. Create one with${NC}"
+    echo -e "${YELLOW}    ./doctor.sh reverse-eng   (business logic only)  or  ./doctor.sh run   (full migration)${NC}"
+
+}
+
+run_rekt_status() {
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║   Cobol-REKT Status                                         ║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+
+    # Check containers
+    local containers=("$NEO4J_CONTAINER" "$REKT_CONTAINER" "$REKT_POPULATOR_CONTAINER")
+    for c in "${containers[@]}"; do
+        local state
+        state=$(docker inspect --format='{{.State.Status}}' "$c" 2>/dev/null || echo "not found")
+        if [[ "$state" == "running" ]]; then
+            echo -e "  ${GREEN}✅ $c: running${NC}"
+        else
+            echo -e "  ${RED}❌ $c: $state${NC}"
+        fi
+    done
+
+    # Neo4j node count
+    if container_exec "$NEO4J_CONTAINER" sh -c \
+        'cypher-shell -u neo4j -p "$HEALTHCHECK_PASSWORD" "MATCH (n) RETURN count(n) AS nodes"' \
+        2>/dev/null | grep -q "[0-9]"; then
+        local node_count
+        node_count=$(container_exec "$NEO4J_CONTAINER" sh -c \
+            'cypher-shell -u neo4j -p "$HEALTHCHECK_PASSWORD" "MATCH (n) RETURN count(n) AS nodes"' \
+            2>/dev/null | tail -1 | tr -d ' "')
+        local rel_count
+        rel_count=$(container_exec "$NEO4J_CONTAINER" sh -c \
+            'cypher-shell -u neo4j -p "$HEALTHCHECK_PASSWORD" "MATCH ()-[r]->() RETURN count(r) AS rels"' \
+            2>/dev/null | tail -1 | tr -d ' "')
+        echo -e "\n  ${BLUE}Graph: ${node_count} nodes, ${rel_count} relationships${NC}"
+    fi
+
+    # rekt output files
+    local json_count
+    json_count=$(find "$REPO_ROOT/output/rekt" -name "*.json" 2>/dev/null | wc -l | tr -d ' ')
+    echo -e "  ${BLUE}Rekt JSON exports: ${json_count} files in output/rekt/${NC}"
+
+    echo -e "\n  ${BLUE}Ports:${NC}"
+    echo -e "    Neo4j: http://localhost:$NEO4J_HTTP_PORT (bolt://localhost:$NEO4J_BOLT_PORT)"
+}
+
+# Emits the --programs argument when a selection is active, and nothing otherwise,
+# so an unscoped run is byte-identical to what it was before selection existed.
+# Each conversion writes to a folder named for when it ran. Writing every run to
+# output/<lang> meant a second run silently overwrote the first: two runs could not be
+# compared, a demo could not be kept, and a partial re-run left the previous run's files
+# beside the new ones with nothing to say which was which. Readers treat output/<lang> as
+# the stable root and resolve the newest run beneath it, so nothing needs the stamp.
+export_run_output_folder() {
+    local stamp
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    if [[ "$TARGET_LANGUAGE" == "Java" ]]; then
+        export JAVA_OUTPUT_FOLDER="output/java/$stamp"
+        echo -e "  ${CYAN}Run output: $JAVA_OUTPUT_FOLDER${NC}"
+    else
+        export CSHARP_OUTPUT_FOLDER="output/csharp/$stamp"
+        echo -e "  ${CYAN}Run output: $CSHARP_OUTPUT_FOLDER${NC}"
+    fi
+}
+
+program_args() {
+    if [[ -n "${PROGRAM_SELECTION:-}" ]]; then
+        printf '%s' "--programs $PROGRAM_SELECTION"
+    fi
+}
+
+# Stale files from an earlier run are counted by the parity report as though this run
+# produced them, which inflates coverage.
+clean_output_if_requested() {
+    if [[ "$CLEAN_OUTPUT" != "true" ]]; then
+        return 0
+    fi
+    local target_dir="$REPO_ROOT/output/${1:-java}"
+    if [[ -d "$target_dir" ]]; then
+        echo -e "${YELLOW}🧹 Clearing $target_dir before conversion${NC}"
+        find "$target_dir" -mindepth 1 -delete 2>/dev/null || true
+    fi
+}
+
+# Every conversion entry point runs this: refuse to start beside another run, honour
+# --dry-run, and clear output when asked.
+conversion_preflight() {
+    guard_concurrent_run || exit 1
+    if [[ "$DRY_RUN" == "true" ]]; then
+        show_dry_run
+        exit 0
+    fi
+    local lang_dir="java"
+    [[ "${TARGET_LANGUAGE:-Java}" == "CSharp" ]] && lang_dir="csharp"
+    clean_output_if_requested "$lang_dir"
+}
+
+# ── Program selection ───────────────────────────────────────────────────────
+#
+# Scopes a conversion to chosen programs. The selection narrows which programs are
+# converted; it does not narrow what the conversion can see, because copybooks are
+# always retained by the CLI. Nothing is copied to a staging folder: the source root
+# stays put, so report, parity and output paths mean the same thing in a scoped run
+# as in a full one.
+
+SELECTED_PROGRAMS=()
+SELECTED_JOBS=()
+INCLUDE_CALLEES=false
+DRY_RUN=false
+CLEAN_OUTPUT=false
+
+portal_base() { echo "http://localhost:${DEFAULT_MCP_PORT}"; }
+
+# Reachability is not enough: the portal serves its SPA fallback with HTTP 200 for
+# routes it does not know, so an older build answers this URL with HTML. Checking the
+# content type distinguishes "portal is down" from "portal predates this endpoint",
+# which need different fixes.
+portal_is_up() {
+    local ctype
+    ctype=$(curl -s -o /dev/null --max-time 3 -w '%{content_type}' \
+        "$(portal_base)/api/modernization/programs" 2>/dev/null)
+    [[ "$ctype" == application/json* ]]
+}
+
+portal_reachable() {
+    curl -s -o /dev/null --max-time 3 "$(portal_base)/" 2>/dev/null
+}
+
+# The estate lives behind the portal API, which is the same source the dashboard
+# reads. Asking it keeps one definition of "which programs exist" rather than a
+# second one written in bash that can drift from it.
+require_portal_for_selection() {
+    if portal_is_up; then
+        return 0
+    fi
+    if portal_reachable; then
+        echo -e "${YELLOW}⚠️  The portal is running but does not serve the program list.${NC}"
+        echo -e "   It is an older build. Restart it from this checkout:"
+        echo -e "   ${GREEN}./doctor.sh portal${NC}"
+    else
+        echo -e "${YELLOW}⚠️  The portal is not running, so program data is unavailable.${NC}"
+        echo -e "   Start it with ${GREEN}./doctor.sh portal${NC} in another terminal, then retry."
+    fi
+    return 1
+}
+
+# Expands the selection to every program reachable by CALL. Without this a converted
+# program can call something that was never converted.
+expand_callees() {
+    local expanded_file
+    expanded_file="$(mktemp)"
+    printf '%s\n' "${SELECTED_PROGRAMS[@]}" > "$expanded_file"
+
+    local identity
+    for identity in "${SELECTED_PROGRAMS[@]}"; do
+        curl -s --max-time 10 "$(portal_base)/api/modernization/program/${identity}" \
+            | "$PYTHON_CMD" -c "
+import json,sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for p in d.get('callClosure') or []:
+    print(p)
+" >> "$expanded_file" 2>/dev/null
+    done
+
+    local before=${#SELECTED_PROGRAMS[@]}
+    SELECTED_PROGRAMS=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && SELECTED_PROGRAMS+=("$line")
+    done < <(sort -u "$expanded_file")
+    rm -f "$expanded_file"
+
+    local added=$((${#SELECTED_PROGRAMS[@]} - before))
+    if [[ $added -gt 0 ]]; then
+        echo -e "  ${BLUE}Call closure added $added program(s).${NC}"
+    else
+        echo -e "  ${BLUE}Call closure added nothing: the selection calls no other program in this estate.${NC}"
+    fi
+}
+
+# A selected name that matches no source file converts fewer programs than asked for,
+# which looks exactly like a run that succeeded. Checked before any model is called.
+validate_selection() {
+    local unmatched=()
+    local identity
+    for identity in "${SELECTED_PROGRAMS[@]}"; do
+        if [[ -z "$(find -L "$REPO_ROOT/${COBOL_SOURCE_FOLDER:-source}" -path "*${identity}" -print -quit 2>/dev/null)" ]] \
+           && [[ -z "$(find -L "$REPO_ROOT/${COBOL_SOURCE_FOLDER:-source}" -name "${identity}" -print -quit 2>/dev/null)" ]] \
+           && [[ -z "$(find -L "$REPO_ROOT/${COBOL_SOURCE_FOLDER:-source}" -name "${identity}.*" -print -quit 2>/dev/null)" ]]; then
+            unmatched+=("$identity")
+        fi
+    done
+
+    if [[ ${#unmatched[@]} -gt 0 ]]; then
+        echo -e "${RED}❌ No source file matches:${NC}"
+        printf '   %s\n' "${unmatched[@]}"
+        echo -e "   Run ${GREEN}./doctor.sh programs${NC} to see what is convertible."
+        return 1
+    fi
+    return 0
+}
+
+# ── Estate graph ────────────────────────────────────────────────────────────
+
+# Clusters and waves from the source alone; with a cluster id, that cluster's slice and the command
+# that converts it.
+run_estate_graph() {
+    local cluster="${1:-}"
+    local src="$REPO_ROOT/${COBOL_SOURCE_FOLDER:-source}"
+    local jcl_dir
+    jcl_dir="$(jcl_source_dir)"
+    if [[ ! -d "$src" ]]; then
+        echo -e "${YELLOW}⚠️  No source folder at $src.${NC}"
+        return 1
+    fi
+
+    # Build once, quietly: dotnet run would print restore warnings onto the JSON on stdout.
+    if ! (cd "$REPO_ROOT" && "$DOTNET_CMD" build CobolToQuarkusMigration.csproj -v q -nologo >/dev/null 2>&1); then
+        echo -e "${RED}❌ Build failed. Run: dotnet build CobolToQuarkusMigration.csproj${NC}"
+        return 1
+    fi
+
+    local args=(estate-graph "$src" --output "$REPO_ROOT/output/estate/estate-graph.json")
+    [[ -d "$jcl_dir" && "$jcl_dir" != "$src" ]] && args+=(--jcl-source "$jcl_dir")
+
+    if [[ -z "$cluster" ]]; then
+        echo -e "${BLUE}🗺️  Estate graph (no model)${NC}"
+        echo "=============================================="
+        (cd "$REPO_ROOT" && "$DOTNET_CMD" run --project CobolToQuarkusMigration.csproj --no-build -- "${args[@]}") || return 1
+        echo ""
+        echo -e "  Slice of one cluster:  ${CYAN}./doctor.sh estate C01${NC}"
+        echo -e "  Explore it in the portal:  ${CYAN}./doctor.sh portal${NC}  → Estate Mission Control"
+        return 0
+    fi
+
+    local slice
+    slice="$(cd "$REPO_ROOT" && "$DOTNET_CMD" run --project CobolToQuarkusMigration.csproj --no-build -- "${args[@]}" --slice "$cluster" 2>/dev/null)" || {
+        echo -e "${RED}❌ No cluster '$cluster'. Run ./doctor.sh estate to list them.${NC}"
+        return 1
+    }
+    echo "$slice"
+    local selectors
+    if [[ -z "$PYTHON_CMD" ]]; then
+        echo -e "${YELLOW}⚠️  Python is required to list the slice selectors.${NC}"
+        return 0
+    fi
+    selectors="$(printf '%s' "$slice" | "$PYTHON_CMD" -c 'import json,sys; s=json.load(sys.stdin); print(",".join(s["programSelectors"]+s["needSelectors"]))')"
+    echo ""
+    echo -e "  Convert this slice:  ${CYAN}./doctor.sh convert-only --program ${selectors}${NC}"
+}
+
+# ── JCL ─────────────────────────────────────────────────────────────────────
+
+# Where the JCL is: JCL_SOURCE_FOLDER when set, else the COBOL source folder, as the conversion reads it.
+jcl_source_dir() {
+    local dir="${JCL_SOURCE_FOLDER:-${COBOL_SOURCE_FOLDER:-source}}"
+    [[ "$dir" == /* ]] || dir="$REPO_ROOT/$dir"
+    printf '%s' "$dir"
+}
+
+current_run_output_dir() {
+    local dir
+    if [[ "$TARGET_LANGUAGE" == "Java" ]]; then dir="${JAVA_OUTPUT_FOLDER:-}"; else dir="${CSHARP_OUTPUT_FOLDER:-}"; fi
+    [[ -z "$dir" ]] && return 0
+    [[ "$dir" == /* ]] || dir="$REPO_ROOT/$dir"
+    printf '%s' "$dir"
+}
+
+# The COBOL source of a program id, source-relative, or nothing when the estate does not have it.
+program_source_for() {
+    local root="$REPO_ROOT/${COBOL_SOURCE_FOLDER:-source}"
+    local found
+    found=$(find -L "$root" \( -name .rekt-staging -o -name .preprocessed \) -prune -o \
+        -type f \( -iname "$1.cbl" -o -iname "$1.cob" \) -print -quit 2>/dev/null)
+    [[ -n "$found" ]] && printf '%s' "${found#"$root"/}"
+}
+
+# Turns --job into the programs those jobs run, read by the same parser that generates the jobs.
+# A program with no source is reported rather than selected: selecting it would stop the run,
+# and the job's step for it abends S806 until its source is added.
+resolve_job_selection() {
+    local jobs_arg errors listing
+    jobs_arg="$(IFS=','; echo "${SELECTED_JOBS[*]}")"
+    errors="$(mktemp)"
+    # The CLI writes start-up lines to stdout; the result is the tab-separated lines.
+    if ! listing=$(cd "$REPO_ROOT" && "$DOTNET_CMD" run --project CobolToQuarkusMigration.csproj -- \
+            jcl-programs "$(jcl_source_dir)" --jobs "$jobs_arg" 2>"$errors"); then
+        echo -e "${RED}❌ Could not resolve --job:${NC}"
+        grep -v '^\s*$' "$errors" | tail -5 | sed 's/^/   /'
+        echo -e "   Run ${GREEN}./doctor.sh jcl${NC} to list the jobs in the source."
+        rm -f "$errors"
+        return 1
+    fi
+    rm -f "$errors"
+
+    local job file programs program rel missing=0 added=0 existing known
+    echo -e "${CYAN}🧾 Jobs: ${#SELECTED_JOBS[@]} selected${NC}"
+    while IFS=$'\t' read -r job file programs; do
+        echo -e "  ${BOLD}$job${NC}  $file"
+        if [[ -z "$programs" ]]; then
+            echo -e "    runs utilities only, no estate programs"
+            continue
+        fi
+        IFS=',' read -ra _progs <<< "$programs"
+        for program in "${_progs[@]}"; do
+            rel="$(program_source_for "$program")"
+            if [[ -z "$rel" ]]; then
+                echo -e "    ${YELLOW}✗ $program${NC}  not in the source: its step abends S806 until it is added"
+                missing=$((missing + 1))
+                continue
+            fi
+            echo -e "    ${GREEN}✓ $program${NC}  $rel"
+            known=false
+            for existing in "${SELECTED_PROGRAMS[@]}"; do
+                [[ "$existing" == "$rel" ]] && known=true && break
+            done
+            if [[ "$known" == "false" ]]; then
+                SELECTED_PROGRAMS+=("$rel")
+                added=$((added + 1))
+            fi
+        done
+    done < <(printf '%s\n' "$listing" | grep $'\t')
+
+    if [[ ${#SELECTED_PROGRAMS[@]} -eq 0 ]]; then
+        echo -e "${RED}❌ None of the programs these jobs run is in the source, so there is nothing to convert.${NC}"
+        echo -e "   Add their COBOL to source/, or generate the jobs alone with ${GREEN}./doctor.sh jcl${NC}."
+        return 1
+    fi
+    [[ $missing -gt 0 ]] && echo -e "  ${YELLOW}$missing program(s) are not in the source and will not be converted.${NC}"
+    return 0
+}
+
+# Per job, what it still needs before it runs end to end, read from the jobs-manifest.json in a
+# run folder. Limited to --job when given.
+print_jcl_job_summary() {
+    local manifest="${1:-}/jobs-manifest.json"
+    [[ -n "${1:-}" && -f "$manifest" ]] || return 0
+    "$PYTHON_CMD" - "$manifest" "$(IFS=','; echo "${SELECTED_JOBS[*]}")" <<'PYEOF'
+import json, os, re, sys
+
+entries = json.load(open(sys.argv[1]))
+typed = {n.strip().lower(): n.strip() for n in sys.argv[2].split(",") if n.strip()}
+wanted = set(typed)
+
+def names(e):
+    # A repeated job name runs as NAME_2; the member name is what the source folder shows.
+    job = e["job"].lower()
+    return {job, re.sub(r"_\d+$", "", job), os.path.splitext(os.path.basename(e["file"]))[0].lower()}
+
+if wanted:
+    for name in sorted(wanted - set().union(*(names(e) for e in entries))):
+        print(f"⚠️  No JCL job is named {typed[name]}.")
+    entries = [e for e in entries if names(e) & wanted]
+
+ready = 0
+print()
+print(f"🧾 JCL jobs ({len(entries)}): see {sys.argv[1]}")
+for e in entries:
+    missing, blocked = e.get("programsMissing") or [], e.get("stepsNotRunnable") or []
+    if not missing and not blocked:
+        ready += 1
+        count = len(e.get("programs") or [])
+        print(f"  ✅ {e['job']:<10} " + (f"all {count} program(s) converted" if count else "runs utilities only, every step runnable"))
+        continue
+    programs = e.get("programs") or []
+    print(f"  ⚠️  {e['job']:<10} " + "; ".join(filter(None, [
+        (f"{len(e.get('programsImplemented') or [])}/{len(programs)} program(s) converted"
+         + (f", not yet: {', '.join(missing)}" if missing else "")) if programs else "runs utilities only",
+        f"{len(blocked)} step(s) cannot run (procedure missing or condition unreadable)" if blocked else "",
+    ])))
+print(f"  {ready} of {len(entries)} job(s) have every program and step they need.")
+if ready < len(entries):
+    print("  A missing procedure or INCLUDE member is named in the manifest's diagnostics: add it to the source.")
+print("  Utilities other than IEFBR14 and IDCAMS (a sort, a Db2 unload) stop the job until implemented: docs/jcl-jobs.md")
+PYEOF
+}
+
+# Jobs from the JCL alone: parse, generate, and for C# build, without a model. The jobs run the
+# converted programs, so this shows what a conversion would give the jobs and what they still lack.
+run_jcl_jobs() {
+    echo -e "${BLUE}🧾 JCL jobs (no model)${NC}"
+    echo "=============================================="
+
+    local jcl_dir
+    jcl_dir="$(jcl_source_dir)"
+    if [[ -z "$(find -L "$jcl_dir" -type f -iname '*.jcl' -print -quit 2>/dev/null)" ]]; then
+        echo -e "${YELLOW}⚠️  No .jcl files under $jcl_dir.${NC}"
+        echo -e "   Put the JCL, with its procedures and INCLUDE members, under source/ (or set JCL_SOURCE_FOLDER)."
+        return 1
+    fi
+
+    if [[ -z "${TARGET_LANGUAGE:-}" ]]; then
+        echo "🎯 Select Target Language"
+        echo "  1) Java (Spring Batch)"
+        echo "  2) C# (.NET)"
+        read -p "Enter choice (1 or 2) [default: 1]: " lang_choice
+        if [[ "$(echo "$lang_choice" | tr -d '[:space:]')" == "2" ]]; then
+            export TARGET_LANGUAGE="CSharp"
+        else
+            export TARGET_LANGUAGE="Java"
+        fi
+    fi
+    export_run_output_folder
+    local run_dir
+    run_dir="$(current_run_output_dir)"
+
+    echo -e "${BLUE}Parsing JCL → output/rekt/${NC}"
+    if ! (set -o pipefail; cd "$REPO_ROOT" && "$DOTNET_CMD" run --project CobolToQuarkusMigration.csproj -- \
+            jcl-facts "$jcl_dir" --output-dir "$REPO_ROOT/output/rekt" 2>&1 | grep -E '^jcl-facts:|rror'); then
+        echo -e "${RED}❌ jcl-facts failed.${NC}"
+        return 1
+    fi
+
+    echo -e "${BLUE}Generating jobs → ${run_dir#"$REPO_ROOT"/}${NC}"
+    if ! (set -o pipefail; cd "$REPO_ROOT" && "$DOTNET_CMD" run --project CobolToQuarkusMigration.csproj --no-build -- \
+            jcl-jobs "$jcl_dir" --language "$TARGET_LANGUAGE" --output-dir "$run_dir" 2>&1 | grep -E '^jcl-jobs:|rror'); then
+        echo -e "${RED}❌ jcl-jobs failed.${NC}"
+        return 1
+    fi
+
+    if [[ "$TARGET_LANGUAGE" == "CSharp" ]]; then
+        echo -e "${BLUE}Building the generated jobs${NC}"
+        local build_log
+        build_log="$(mktemp)"
+        if (cd "$run_dir" && "$DOTNET_CMD" build -v q -nologo > "$build_log" 2>&1); then
+            echo -e "  ${GREEN}✅ Compiles${NC}"
+        else
+            echo -e "  ${RED}❌ Does not compile:${NC}"
+            grep -E ' error ' "$build_log" | head -10 | sed 's/^/   /'
+            rm -f "$build_log"
+            return 1
+        fi
+        rm -f "$build_log"
+    elif command -v mvn >/dev/null 2>&1; then
+        echo -e "${BLUE}Building the generated jobs (mvn compile)${NC}"
+        local build_log
+        build_log="$(mktemp)"
+        if (cd "$run_dir" && mvn -q -B compile > "$build_log" 2>&1); then
+            echo -e "  ${GREEN}✅ Compiles${NC}"
+            echo -e "  Run a job: ${CYAN}(cd $run_dir && mvn spring-boot:run -Dspring-boot.run.arguments=--spring.batch.job.name=<JOB>)${NC}"
+        else
+            echo -e "  ${RED}❌ Does not compile:${NC}"
+            grep -E 'ERROR' "$build_log" | head -10 | sed 's/^/   /'
+            rm -f "$build_log"
+            return 1
+        fi
+        rm -f "$build_log"
+    else
+        echo -e "  ${BLUE}Maven not found, so the jobs were not compiled. Build them with: (cd $run_dir && mvn compile)${NC}"
+    fi
+
+    print_jcl_job_summary "$run_dir"
+    echo ""
+    echo -e "${BOLD}Next:${NC} convert the programs the jobs run, so each step has its program and the converter"
+    echo -e "is told the batch-program contract the job runner calls:"
+    echo -e "  ${CYAN}./doctor.sh run --job <JOB> --language $TARGET_LANGUAGE${NC}   (or every job: ./doctor.sh run)"
+}
+
+# Two runs writing to one output directory interleave their files, and the result
+# looks like a single successful conversion.
+guard_concurrent_run() {
+    # Matches a conversion, which always carries --source. The same assembly also runs
+    # persistently as the MCP server and for short-lived subcommands; neither writes to
+    # the output folder, and treating them as a run would block every conversion.
+    local running
+    running=$(pgrep -f "CobolToQuarkusMigration.dll .*--source" 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "${running:-0}" -gt 0 ]]; then
+        echo -e "${RED}❌ A migration is already running ($running process(es)).${NC}"
+        echo -e "   Two runs share one output folder and overwrite each other's files."
+        echo -e "   Wait for it to finish, or stop it, then retry."
+        return 1
+    fi
+    return 0
+}
+
+# Lists what can be converted, so a selection is made from real names rather than guesses.
+run_program_list() {
+    require_portal_for_selection || return 1
+
+    echo -e "${BOLD}Convertible programs${NC}"
+    echo ""
+    curl -s --max-time 15 "$(portal_base)/api/modernization/programs" | "$PYTHON_CMD" -c "
+import json,sys
+d = json.load(sys.stdin)
+progs = d.get('programs') or []
+print(f\"{'PROGRAM':<24}{'LINES':>8}  {'PARSE':<10}{'CALLS':>6}{'CALLED BY':>11}  PATH\")
+print('-' * 96)
+for p in progs:
+    warn = '  ⚠ %d missing cpy' % p['missingCopybookCount'] if p.get('missingCopybookCount') else ''
+    print(f\"{p['basename']:<24}{p['linesOfCode']:>8}  {p['parseFidelity']:<10}\"
+          f\"{p['callClosureCount']:>6}{p['calledByCount']:>11}  {p['relativePath']}{warn}\")
+print()
+print(f\"{d.get('totalPrograms',0)} programs, {d.get('totalCopybooks',0)} copybooks.\")
+print('Copybooks are always included in a conversion and are not selected directly.')
+" 2>/dev/null || {
+        echo -e "${RED}❌ Could not read the program list from the portal.${NC}"
+        return 1
+    }
+}
+
+# Shows what a selection would convert, without calling a model.
+show_dry_run() {
+    echo ""
+    echo -e "${BOLD}Dry run — nothing will be converted${NC}"
+    echo ""
+    echo -e "  Target language: ${GREEN}${TARGET_LANGUAGE:-Java}${NC}"
+    echo -e "  Programs (${#SELECTED_PROGRAMS[@]}):"
+    printf '    %s\n' "${SELECTED_PROGRAMS[@]}"
+    echo ""
+    echo -e "  ${BLUE}All copybooks are included regardless of selection.${NC}"
+    echo -e "  Remove ${GREEN}--dry-run${NC} to convert."
+    echo ""
+}
+
+# Main command routing
+main() {
+    # Create required directories if they don't exist
+    mkdir -p "$REPO_ROOT/source" "$REPO_ROOT/output" "$REPO_ROOT/Logs"
+    ensure_copilot_cli_for_build
+
+    # Selector flags are pre-parsed so they may appear in any position. Repeating
+    # --program selects more programs; the flags are removed before command routing.
+    local positional=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --program|--programs)
+                if [[ -z "${2:-}" ]]; then
+                    echo -e "${RED}❌ $1 requires a program name or path${NC}"; exit 1
+                fi
+                IFS=',' read -ra _names <<< "$2"
+                local _n
+                for _n in "${_names[@]}"; do
+                    _n="$(echo "$_n" | xargs)"
+                    [[ -n "$_n" ]] && SELECTED_PROGRAMS+=("$_n")
+                done
+                shift 2 ;;
+            --job|--jobs)
+                if [[ -z "${2:-}" ]]; then
+                    echo -e "${RED}❌ $1 requires a JCL job or member name${NC}"; exit 1
+                fi
+                IFS=',' read -ra _names <<< "$2"
+                local _j
+                for _j in "${_names[@]}"; do
+                    _j="$(echo "$_j" | xargs)"
+                    [[ -n "$_j" ]] && SELECTED_JOBS+=("$_j")
+                done
+                shift 2 ;;
+            --include-callees)
+                INCLUDE_CALLEES=true; shift ;;
+            --dry-run)
+                DRY_RUN=true; shift ;;
+            --clean-output)
+                CLEAN_OUTPUT=true; shift ;;
+            --language|--target-language)
+                if [[ -z "${2:-}" ]]; then
+                    echo -e "${RED}❌ $1 requires Java or CSharp${NC}"; exit 1
+                fi
+                case "$(echo "$2" | tr '[:upper:]' '[:lower:]')" in
+                    java) export TARGET_LANGUAGE="Java" ;;
+                    csharp|c#|cs) export TARGET_LANGUAGE="CSharp" ;;
+                    *) echo -e "${RED}❌ Unknown language: $2 (use Java or CSharp)${NC}"; exit 1 ;;
+                esac
+                shift 2 ;;
+            *)
+                positional+=("$1"); shift ;;
+        esac
+    done
+    set -- "${positional[@]}"
+
+    local job_callees=false
+    if [[ ${#SELECTED_JOBS[@]} -gt 0 && "${1:-}" != "jcl" ]]; then
+        resolve_job_selection || exit 1
+        # A job runs end to end only if the programs its programs CALL are converted too, so
+        # --job takes the call closure whenever the portal can supply it.
+        if [[ "$INCLUDE_CALLEES" != "true" ]]; then
+            if portal_is_up; then
+                job_callees=true
+            else
+                echo -e "  ${YELLOW}⚠️  Programs these call are not added: the portal is not running.${NC}"
+                echo -e "     Start it with ${GREEN}./doctor.sh portal${NC} to include them, or ignore this if they call nothing."
+            fi
+        fi
+    fi
+
+    if [[ ${#SELECTED_PROGRAMS[@]} -gt 0 ]]; then
+        if [[ "$INCLUDE_CALLEES" == "true" ]]; then
+            require_portal_for_selection || exit 1
+            expand_callees
+        elif [[ "$job_callees" == "true" ]]; then
+            expand_callees
+        fi
+        validate_selection || exit 1
+        export PROGRAM_SELECTION="$(IFS=','; echo "${SELECTED_PROGRAMS[*]}")"
+        echo -e "${CYAN}🎯 Selection: ${#SELECTED_PROGRAMS[@]} program(s)${NC}"
+    fi
+
+    case "${1:-doctor}" in
+        "setup")
+            run_setup
+            ;;
+        "test")
+            run_test
+            ;;
+        "run"|"run-chunked"|"chunked")
+            # All run commands use the same function - chunking is auto-detected
+            conversion_preflight
+            run_migration
+            ;;
+        "convert-only"|"conversion-only"|"convert")
+            conversion_preflight
+            run_conversion_only
+            ;;
+        "jcl"|"jcl-jobs")
+            run_jcl_jobs
+            ;;
+        "programs"|"list-programs")
+            run_program_list
+            ;;
+        "estate"|"estate-graph")
+            run_estate_graph "${2:-}"
+            ;;
+        "portal"|"web"|"ui")
+            run_portal
+            ;;
+        "doctor"|"")
+            run_doctor
+            ;;
+        "reverse-eng"|"reverse-engineer"|"reverse")
+            run_reverse_engineering
+            ;;
+        "resume")
+            guard_concurrent_run || exit 1
+            run_resume
+            ;;
+        "monitor")
+            run_monitor
+            ;;
+        "conversation")
+            run_conversation
+            ;;
+        "chunking-health"|"chunk-health"|"chunks")
+            check_chunking_health
+            ;;
+        "validate")
+            run_validate
+            ;;
+        "rekt"|"rekt-parse")
+            run_rekt_parse
+            ;;
+        "rekt-ingest")
+            run_rekt_ingest
+            ;;
+        "rekt-full")
+            run_rekt_full
+            ;;
+        "rekt-status")
+            run_rekt_status
+            ;;
+        "help"|"-h"|"--help")
+            show_usage
+            ;;
+        *)
+            echo -e "${RED}❌ Unknown command: $1${NC}"
+            echo ""
+            show_usage
+            exit 1
+            ;;
+    esac
+}
+
+# Function to check chunking infrastructure health
+check_chunking_health() {
+    echo -e "${BLUE}🧩 Smart Chunking Health Check${NC}"
+    echo "================================"
+    echo ""
+    
+    local db_path
+    db_path="$(get_migration_db_path)"
+    
+    # Check 1: Database existence
+    echo -e "${CYAN}1. Database Status${NC}"
+    if [[ -f "$db_path" ]]; then
+        echo -e "   ${GREEN}✅ Database found:${NC} $db_path"
+        local db_size=$(du -h "$db_path" 2>/dev/null | cut -f1)
+        echo -e "   ${GREEN}✅ Size:${NC} $db_size"
+    else
+        echo -e "   ${YELLOW}⚠️  Database not found (will be created on first run)${NC}"
+    fi
+    echo ""
+    
+    # Check 2: Required process files
+    echo -e "${CYAN}2. Smart Chunking Components${NC}"
+    local components=(
+        "Processes/SmartMigrationOrchestrator.cs:SmartMigrationOrchestrator (routes files by size)"
+        "Processes/ChunkedMigrationProcess.cs:ChunkedMigrationProcess (conversion)"
+        "Processes/ChunkedReverseEngineeringProcess.cs:ChunkedReverseEngineeringProcess (RE analysis)"
+        "Chunking/ChunkingOrchestrator.cs:ChunkingOrchestrator (chunk coordination)"
+    )
+    for component in "${components[@]}"; do
+        local file=$(echo "$component" | cut -d':' -f1)
+        local desc=$(echo "$component" | cut -d':' -f2)
+        if [[ -f "$REPO_ROOT/$file" ]]; then
+            echo -e "   ${GREEN}✅ $desc${NC}"
+        else
+            echo -e "   ${RED}❌ $desc - MISSING${NC}"
+        fi
+    done
+    echo ""
+    
+    # Check 2b: Required tables
+    echo -e "${CYAN}3. Chunking Tables${NC}"
+    if [[ -f "$db_path" ]]; then
+        local tables=("chunk_metadata" "forward_references" "signatures" "type_mappings")
+        for table in "${tables[@]}"; do
+            resolve_sqlite3 2>/dev/null
+            local exists=$($SQLITE3_CMD "$db_path" "SELECT name FROM sqlite_master WHERE type='table' AND name='$table';" 2>/dev/null)
+            if [[ -n "$exists" ]]; then
+                local count=$($SQLITE3_CMD "$db_path" "SELECT COUNT(*) FROM $table;" 2>/dev/null)
+                echo -e "   ${GREEN}✅ $table${NC} ($count rows)"
+            else
+                echo -e "   ${YELLOW}⚠️  $table not found (created on first chunked run)${NC}"
+            fi
+        done
+    else
+        echo -e "   ${YELLOW}ℹ️  Tables will be created when database is initialized${NC}"
+    fi
+    echo ""
+    
+    # Check 4: Chunking configuration
+    echo -e "${CYAN}4. Configuration (appsettings.json)${NC}"
+    local config_file="$REPO_ROOT/Config/appsettings.json"
+    if [[ -f "$config_file" ]] && command -v jq >/dev/null 2>&1; then
+        local enabled=$(jq -r '.ChunkingSettings.EnableChunking // "auto"' "$config_file" 2>/dev/null)
+        local max_lines=$(jq -r '.ChunkingSettings.MaxLinesPerChunk // 10000' "$config_file" 2>/dev/null)
+        local max_tokens=$(jq -r '.ChunkingSettings.MaxTokensPerChunk // 28000' "$config_file" 2>/dev/null)
+        local overlap=$(jq -r '.ChunkingSettings.OverlapLines // 500' "$config_file" 2>/dev/null)
+        local parallel=$(jq -r '.ChunkingSettings.MaxParallelChunks // 3' "$config_file" 2>/dev/null)
+        local resumable=$(jq -r '.ChunkingSettings.EnableResumability // true' "$config_file" 2>/dev/null)
+        
+        echo -e "   ${GREEN}✅ EnableChunking:${NC} $enabled (auto-detects large files)"
+        echo -e "   ${GREEN}✅ MaxLinesPerChunk:${NC} $max_lines"
+        echo -e "   ${GREEN}✅ MaxTokensPerChunk:${NC} $max_tokens"
+        echo -e "   ${GREEN}✅ OverlapLines:${NC} $overlap"
+        echo -e "   ${GREEN}✅ MaxParallelChunks:${NC} $parallel"
+        echo -e "   ${GREEN}✅ EnableResumability:${NC} $resumable"
+    else
+        echo -e "   ${YELLOW}⚠️  Cannot parse config (jq not installed or config missing)${NC}"
+        echo -e "   ${BLUE}ℹ️  Install jq: brew install jq${NC}"
+    fi
+    echo ""
+    
+    # Check 5: Recent chunk activity
+    echo -e "${CYAN}5. Recent Chunk Activity${NC}"
+    if [[ -f "$db_path" ]]; then
+        resolve_sqlite3 2>/dev/null
+        local recent=$($SQLITE3_CMD "$db_path" "
+            SELECT run_id, source_file, 
+                   COUNT(*) as chunks,
+                   SUM(CASE WHEN status='Completed' THEN 1 ELSE 0 END) as completed,
+                   SUM(CASE WHEN status='Failed' THEN 1 ELSE 0 END) as failed
+            FROM chunk_metadata
+            GROUP BY run_id, source_file
+            ORDER BY run_id DESC
+            LIMIT 5;
+        " 2>/dev/null)
+        
+        if [[ -n "$recent" ]]; then
+            echo -e "   Recent chunked files:"
+            echo "$recent" | while IFS='|' read -r run_id file chunks completed failed; do
+                local status_icon="✅"
+                [[ "$failed" -gt 0 ]] && status_icon="⚠️"
+                echo -e "   $status_icon Run $run_id: $file - $completed/$chunks chunks complete"
+            done
+        else
+            echo -e "   ${BLUE}ℹ️  No chunked migrations yet${NC}"
+        fi
+    else
+        echo -e "   ${BLUE}ℹ️  No migration history yet${NC}"
+    fi
+    echo ""
+    
+    # Check 6: Container Health
+    echo -e "${CYAN}6. Container Health${NC}"
+    
+    # Check if container is running
+    if command -v docker >/dev/null 2>&1; then
+        if docker ps --format '{{.Names}}' | grep -qx "$PORTAL_CONTAINER"; then
+            echo -e "   ${GREEN}✅ Container '$PORTAL_CONTAINER' is running${NC}"
+        else
+            echo -e "   ${YELLOW}⚠️  Container '$PORTAL_CONTAINER' is NOT running${NC}"
+            echo -e "      (Run 'docker compose up -d' to start the containerized portal)"
+        fi
+    else
+        echo -e "   ${YELLOW}⚠️  Docker not available - skipping container checks${NC}"
+    fi
+    echo ""
+    
+    # Check 7: Source file analysis
+    echo -e "${CYAN}7. Source File Analysis${NC}"
+    local cobol_files=$(find "$REPO_ROOT/source" -name "*.cbl" 2>/dev/null)
+    if [[ -n "$cobol_files" ]]; then
+        local large_file_count=0
+        local total_lines=0
+        
+        while IFS= read -r file; do
+            local lines=$(wc -l < "$file" 2>/dev/null | tr -d ' ')
+            total_lines=$((total_lines + lines))
+            if [[ "$lines" -gt 3000 ]]; then
+                large_file_count=$((large_file_count + 1))
+                echo -e "   ${YELLOW}📦 $(basename "$file")${NC} - $lines lines (will be chunked)"
+            fi
+        done <<< "$cobol_files"
+        
+        if [[ "$large_file_count" -eq 0 ]]; then
+            echo -e "   ${GREEN}✅ No large files detected${NC} (all files < 3000 lines)"
+        else
+            echo -e "   ${YELLOW}📊 $large_file_count file(s) will use smart chunking${NC}"
+        fi
+        echo -e "   ${BLUE}ℹ️  Total lines across all files:${NC} $total_lines"
+    else
+        echo -e "   ${YELLOW}⚠️  No COBOL files found in source/${NC}"
+    fi
+    echo ""
+    
+    # Summary
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}💡 Smart Chunking Tips:${NC}"
+    echo "   • Files >150K chars or >3000 lines auto-trigger chunking"
+    echo "   • SmartMigrationOrchestrator routes files to appropriate process"
+    echo "   • Full migration uses ChunkedMigrationProcess for conversion"
+    echo "   • RE-only mode uses ChunkedReverseEngineeringProcess for analysis"
+    echo "   • Monitor progress in portal: http://localhost:5028"
+    echo "   • Adjust MaxLinesPerChunk in appsettings.json for tuning"
+    echo ""
+    echo -e "${GREEN}📊 Output Validation:${NC}"
+    echo "   • Generated code is validated for completeness"
+    echo "   • Large files are reassembled with proper ordering"
+    echo "   • Cross-chunk references are resolved via SignatureRegistry"
+    echo "   • Check output/<lang>/ folder for generated files"
+    echo ""
+}
+
+# Run main function with all arguments
+main "$@"

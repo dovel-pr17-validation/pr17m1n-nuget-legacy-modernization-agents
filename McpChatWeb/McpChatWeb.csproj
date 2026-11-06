@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <!-- See CobolToQuarkusMigration.csproj: avoids an unsigned native launcher being blocked. -->
+    <UseAppHost>false</UseAppHost>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.12" />
+    <!-- Microsoft.Data.Sqlite, Neo4j.Driver, Azure.*, GitHub.Copilot.SDK, and
+         Microsoft.Extensions.AI.* flow transitively from the project reference -->
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CobolToQuarkusMigration.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,86 @@
+{
+	"name": "COBOL Migration with Neo4j & Enhanced Portal",
+	"dockerFile": "Dockerfile",
+	"forwardPorts": [
+		5028,
+		7474,
+		7687
+	],
+	"portsAttributes": {
+		"5028": {
+			"label": "Migration Portal (Enhanced UI with Reports & Mermaid)",
+			"onAutoForward": "openBrowser",
+			"protocol": "http"
+		},
+		"7474": {
+			"label": "Neo4j Browser (Dependency Graphs)",
+			"onAutoForward": "notify",
+			"protocol": "http"
+		},
+		"7687": {
+			"label": "Neo4j Bolt Protocol",
+			"onAutoForward": "silent"
+		}
+	},
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"ms-dotnettools.csharp",
+				"ms-dotnettools.csdevkit",
+				"redhat.java",
+				"vscjava.vscode-java-pack",
+				"redhat.vscode-quarkus",
+				"ms-semantic-kernel.semantic-kernel",
+				"github.copilot",
+				"github.copilot-chat",
+				"ms-azuretools.vscode-docker",
+				"neo4j.neo4j-vscode",
+				"alexcvzz.vscode-sqlite",
+				"bierner.markdown-mermaid"
+			],
+			"settings": {
+				"editor.formatOnSave": true,
+				"editor.defaultFormatter": "ms-dotnettools.csharp",
+				"omnisharp.enableRoslynAnalyzers": true,
+				"omnisharp.enableEditorConfigSupport": true,
+				"dotnet.server.useOmnisharp": false,
+				"files.watcherExclude": {
+					"**/Data/*.db": true,
+					"**/Data/*.db-shm": true,
+					"**/Data/*.db-wal": true,
+					"**/neo4j_data/**": true,
+					"**/bin/**": true,
+					"**/obj/**": true
+				},
+				"files.exclude": {
+					"**/.git": true,
+					"**/.DS_Store": true,
+					"**/bin": true,
+					"**/obj": true
+				}
+			}
+		}
+	},
+	"remoteUser": "vscode",
+	"features": {
+		"ghcr.io/devcontainers/features/docker-in-docker:2": {
+			"version": "latest",
+			"dockerComposeVersion": "v2"
+		},
+		"ghcr.io/devcontainers/features/azure-cli:1": {},
+		"ghcr.io/devcontainers/features/node:1": {
+			"version": "22"
+		},
+		"ghcr.io/devcontainers/features/github-cli:1": {
+			"version": "latest"
+		}
+	},
+	"postCreateCommand": "npm install -g @github/copilot@latest && dotnet restore Legacy-Modernization-Agents.sln && dotnet build Legacy-Modernization-Agents.sln && echo '\n✅ Dev Container Ready!\n\nQuick Start:\n  ./doctor.sh setup\n  ./doctor.sh run\n  Portal: http://localhost:5028\n  Neo4j: http://localhost:7474\n'",
+	"postStartCommand": "bash -c 'sudo chmod 666 /var/run/docker.sock && if [ -f Config/ai-config.local.env ]; then export NEO4J_PASSWORD=\"$(sed -n \"s/^NEO4J_PASSWORD=//p\" Config/ai-config.local.env | tail -1 | tr -d \"\\\"\")\" && export ApplicationSettings__Neo4j__Password=\"$NEO4J_PASSWORD\" && docker-compose up -d neo4j && echo \"Starting services...\" && sleep 3 && cd McpChatWeb && nohup dotnet run --urls \"http://localhost:5028\" > /tmp/cobol-portal.log 2>&1 & echo \"Portal starting on http://localhost:5028\"; else echo \"Run ./doctor.sh setup before starting services\"; fi'",
+	"mounts": [
+		"source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
+	],
+	"runArgs": [
+		"--name=cobol-migration-devcontainer"
+	]
+}

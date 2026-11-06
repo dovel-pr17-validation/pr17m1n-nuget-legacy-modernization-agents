@@ -1,0 +1,480 @@
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Text;
+using System.Text.RegularExpressions;
+using CobolToQuarkusMigration.Helpers;
+
+namespace McpChatWeb.Services;
+
+/// <summary>
+/// Represents a single managed run launched from the portal.
+/// Wraps a doctor.sh subprocess with start/stop/pause and live log capture.
+/// </summary>
+public class ManagedRun
+{
+    public string RunId { get; init; } = Guid.NewGuid().ToString("N")[..8];
+    public string Name { get; set; } = "";
+    public string Command { get; init; } = "";
+    public string TargetLanguage { get; set; } = "Java";
+    public string SpeedProfile { get; set; } = "balanced";
+    public string Status { get; set; } = "pending";  // pending | running | paused | completed | failed | stopped
+    public DateTime StartedAt { get; set; } = DateTime.UtcNow;
+    public DateTime? CompletedAt { get; set; }
+    public int? ExitCode { get; set; }
+    public int? ProcessId { get; set; }
+    // The --programs selection the run converts; empty means the whole estate.
+    public IReadOnlyList<string> Programs { get; init; } = [];
+
+    // Circular buffer for last N lines of output
+    private readonly List<string> _logLines = new();
+    private readonly object _logLock = new();
+    private const int MaxLogLines = 2000;
+
+    public void AppendLog(string line)
+    {
+        lock (_logLock)
+        {
+            _logLines.Add(line);
+            if (_logLines.Count > MaxLogLines)
+                _logLines.RemoveAt(0);
+        }
+    }
+
+    public string[] GetLogLines(int? lastN = null)
+    {
+        lock (_logLock)
+        {
+            if (lastN.HasValue && lastN.Value < _logLines.Count)
+                return _logLines.Skip(_logLines.Count - lastN.Value).ToArray();
+            return _logLines.ToArray();
+        }
+    }
+
+    internal Process? Process { get; set; }
+}
+
+/// <summary>
+/// Manages doctor.sh subprocesses launched from the portal.
+/// Provides start/stop/pause/status for migration runs.
+/// </summary>
+public class ProcessManager : IDisposable
+{
+    private readonly ConcurrentDictionary<string, ManagedRun> _runs = new();
+    private readonly string _repoRoot;
+    private readonly string _doctorShPath;
+
+    private static readonly string[] AllowedCommands = { "migrate", "run", "full", "reverse-engineer", "reverse", "re", "convert-only", "convert", "resume" };
+    private static readonly Regex SafePathPattern = new(@"^[a-zA-Z0-9_\-./]+$", RegexOptions.Compiled);
+    // A program selector is a file name or source-relative path; COBOL names may carry # @ $.
+    private static readonly Regex ProgramSelectorPattern = new(@"^[A-Za-z0-9#@$_\-./]+$", RegexOptions.Compiled);
+    private static readonly string[] CommandsTakingPrograms = { "migrate", "run", "full", "convert-only", "convert" };
+
+    public ProcessManager(string repoRoot)
+    {
+        _repoRoot = Path.GetFullPath(repoRoot);
+        _doctorShPath = Path.Combine(_repoRoot, "doctor.sh");
+    }
+
+    /// <summary>
+    /// Start a doctor.sh command as a managed subprocess.
+    /// </summary>
+    public ManagedRun StartRun(
+        string command,
+        string name,
+        string targetLanguage = "Java",
+        string speedProfile = "balanced",
+        string? sourceFolder = null,
+        string? provider = null,
+        string? modelId = null,
+        Dictionary<string, string>? extraEnv = null,
+        IReadOnlyList<string>? programs = null)
+    {
+        // Validate command against allowlist
+        if (!AllowedCommands.Contains(command.ToLowerInvariant()))
+            throw new ArgumentException($"Invalid command: '{command}'. Allowed: {string.Join(", ", AllowedCommands)}");
+
+        var selection = ValidatePrograms(command, programs);
+        var serviceType = NormalizeProvider(provider);
+
+        // Validate sourceFolder to prevent path traversal and argument injection
+        if (sourceFolder != null)
+        {
+            if (sourceFolder.Contains('\0'))
+                throw new ArgumentException("Source folder contains invalid characters.");
+            if (sourceFolder.Contains(".."))
+                throw new ArgumentException("Source folder must not contain path traversal sequences.");
+            if (!SafePathPattern.IsMatch(sourceFolder))
+                throw new ArgumentException("Source folder contains disallowed characters. Only alphanumeric, dash, underscore, dot, and forward slash are permitted.");
+
+            var resolvedPath = Path.GetFullPath(Path.Combine(_repoRoot, sourceFolder));
+            if (!resolvedPath.StartsWith(_repoRoot + Path.DirectorySeparatorChar) && resolvedPath != _repoRoot)
+                throw new ArgumentException("Source folder must resolve to a path within the repository root.");
+        }
+
+        var run = new ManagedRun
+        {
+            Command = command,
+            Name = string.IsNullOrWhiteSpace(name) ? $"{command}-{DateTime.Now:HHmmss}" : name,
+            TargetLanguage = targetLanguage,
+            SpeedProfile = speedProfile,
+            Programs = selection,
+            Status = "running",
+            StartedAt = DateTime.UtcNow
+        };
+
+        // Build the dotnet command directly instead of going through doctor.sh
+        // (doctor.sh is interactive — we bypass it for non-interactive portal use)
+        var (executable, arguments) = BuildCommand(command, targetLanguage, speedProfile, sourceFolder, selection);
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = executable,
+            WorkingDirectory = _repoRoot,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        if (!OperatingSystem.IsWindows())
+        {
+            // A sh parent lets pause stop every .NET process in the run without stopping the
+            // portal's own child (see ProcessTreeSuspender). Arguments pass through "$@" untouched.
+            psi.FileName = "/bin/sh";
+            psi.ArgumentList.Add("-c");
+            psi.ArgumentList.Add("\"$@\"; exit $?");
+            psi.ArgumentList.Add("migration-run");
+            psi.ArgumentList.Add(executable);
+        }
+
+        foreach (var argument in arguments)
+        {
+            psi.ArgumentList.Add(argument);
+        }
+
+        // Set environment variables
+        psi.Environment["TARGET_LANGUAGE"] = targetLanguage;
+        psi.Environment["MIGRATION_DB_PATH"] = Path.Combine(_repoRoot, "Data", "migration.db");
+        psi.Environment["COBOL_SOURCE_FOLDER"] = sourceFolder ?? "source";
+
+        // Dated per run for the same reason doctor.sh dates it: a second conversion writing to
+        // the same folder silently overwrote the first, leaving two runs indistinguishable.
+        var runFolder = ConversionOutputFolder.NewRunName(DateTimeOffset.Now);
+
+        if (targetLanguage.Equals("CSharp", StringComparison.OrdinalIgnoreCase))
+            psi.Environment["CSHARP_OUTPUT_FOLDER"] = $"output/csharp/{runFolder}";
+        else
+            psi.Environment["JAVA_OUTPUT_FOLDER"] = $"output/java/{runFolder}";
+
+        // Speed profile env vars
+        ApplySpeedProfile(psi.Environment, speedProfile);
+
+        // Extra env vars
+        if (extraEnv != null)
+        {
+            foreach (var (k, v) in extraEnv)
+                psi.Environment[k] = v;
+        }
+
+        // ── Apply provider/model selection from portal UI ──
+        var effectiveModel = modelId ?? Environment.GetEnvironmentVariable("AZURE_OPENAI_MODEL_ID") ?? "gpt-5.1-codex-mini";
+
+        // The portal's own environment (set by ./doctor.sh setup or the setup modal) is the
+        // default; an explicit provider from the UI overrides only the service type.
+        if (serviceType is not null)
+            psi.Environment["AZURE_OPENAI_SERVICE_TYPE"] = serviceType;
+
+        // Set model for ALL agents
+        psi.Environment["AZURE_OPENAI_MODEL_ID"] = effectiveModel;
+        psi.Environment["AZURE_OPENAI_DEPLOYMENT_NAME"] = effectiveModel;
+        psi.Environment["AZURE_OPENAI_COBOL_ANALYZER_MODEL"] = effectiveModel;
+        psi.Environment["AZURE_OPENAI_JAVA_CONVERTER_MODEL"] = effectiveModel;
+        psi.Environment["AZURE_OPENAI_DEPENDENCY_MAPPER_MODEL"] = effectiveModel;
+        psi.Environment["AZURE_OPENAI_UNIT_TEST_MODEL"] = effectiveModel;
+        psi.Environment["AZURE_OPENAI_CHAT_MODEL_ID"] = effectiveModel;
+        psi.Environment["AZURE_OPENAI_CHAT_DEPLOYMENT_NAME"] = effectiveModel;
+
+        try
+        {
+            var process = Process.Start(psi);
+            if (process == null)
+            {
+                run.Status = "failed";
+                run.AppendLog("ERROR: Failed to start process");
+                _runs[run.RunId] = run;
+                return run;
+            }
+
+            run.Process = process;
+            run.ProcessId = process.Id;
+            _runs[run.RunId] = run;
+
+            // Capture stdout/stderr asynchronously
+            _ = CaptureOutputAsync(process.StandardOutput, run);
+            _ = CaptureOutputAsync(process.StandardError, run);
+
+            // Monitor completion
+            _ = MonitorProcessAsync(run);
+
+            run.AppendLog($"[PORTAL] Started: {executable} {string.Join(" ", arguments)}");
+            run.AppendLog($"[PORTAL] PID: {process.Id} | Target: {targetLanguage} | Speed: {speedProfile}");
+
+            Console.WriteLine($"🚀 Run '{run.Name}' started (PID: {process.Id}, command: {command})");
+        }
+        catch (Exception ex)
+        {
+            run.Status = "failed";
+            run.AppendLog($"ERROR: {ex.Message}");
+            _runs[run.RunId] = run;
+        }
+
+        return run;
+    }
+
+    /// <summary>
+    /// Stop (kill) a running process.
+    /// </summary>
+    public bool StopRun(string runId)
+    {
+        if (!_runs.TryGetValue(runId, out var run)) return false;
+        if (run.Process == null || run.Process.HasExited) return false;
+
+        try
+        {
+            run.Process.Kill(entireProcessTree: true);
+            run.Status = "stopped";
+            run.CompletedAt = DateTime.UtcNow;
+            run.AppendLog("[PORTAL] Process stopped by user");
+            Console.WriteLine($"🛑 Run '{run.Name}' stopped");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            run.AppendLog($"[PORTAL] Failed to stop: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Pause a running process and the processes it started.
+    /// </summary>
+    public bool PauseRun(string runId)
+    {
+        if (!_runs.TryGetValue(runId, out var run)) return false;
+        if (run.Process == null || run.Process.HasExited) return false;
+        if (run.Status == "paused") return true;
+
+        try
+        {
+            ProcessTreeSuspender.Suspend(run.Process.Id, includeRoot: OperatingSystem.IsWindows());
+            run.Status = "paused";
+            run.AppendLog("[PORTAL] Process paused by user");
+            Console.WriteLine($"⏸️ Run '{run.Name}' paused");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            run.AppendLog($"[PORTAL] Failed to pause: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Resume a paused process and the processes it started.
+    /// </summary>
+    public bool ResumeRun(string runId)
+    {
+        if (!_runs.TryGetValue(runId, out var run)) return false;
+        if (run.Process == null || run.Process.HasExited) return false;
+        if (run.Status != "paused") return false;
+
+        try
+        {
+            ProcessTreeSuspender.Resume(run.Process.Id, includeRoot: OperatingSystem.IsWindows());
+            run.Status = "running";
+            run.AppendLog("[PORTAL] Process resumed by user");
+            Console.WriteLine($"▶️ Run '{run.Name}' resumed");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            run.AppendLog($"[PORTAL] Failed to resume: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Get all managed runs.
+    /// </summary>
+    public IReadOnlyCollection<ManagedRun> GetAllRuns()
+    {
+        return _runs.Values.OrderByDescending(r => r.StartedAt).ToList();
+    }
+
+    /// <summary>
+    /// Get a specific run.
+    /// </summary>
+    public ManagedRun? GetRun(string runId)
+    {
+        return _runs.TryGetValue(runId, out var run) ? run : null;
+    }
+
+    // Selectors reach the CLI as one --programs argument, so each must be a plain name or path:
+    // no separators the CLI would split on, no option-looking values, nothing outside the source.
+    public static IReadOnlyList<string> ValidatePrograms(string command, IReadOnlyList<string>? programs)
+    {
+        if (programs is null || programs.Count == 0) return [];
+        if (!CommandsTakingPrograms.Contains(command.ToLowerInvariant()))
+            throw new ArgumentException($"Command '{command}' does not take a program selection.");
+
+        var selection = new List<string>();
+        foreach (var raw in programs)
+        {
+            var p = raw?.Trim() ?? "";
+            if (p.Length == 0) continue;
+            if (p.Length > 256 || !ProgramSelectorPattern.IsMatch(p) || p.StartsWith('-') || p.StartsWith('/')
+                || p.Split('/').Any(seg => seg is ".." or "."))
+                throw new ArgumentException($"Invalid program selector: '{p}'. Use a file name or a source-relative path.");
+            if (!selection.Contains(p, StringComparer.OrdinalIgnoreCase)) selection.Add(p);
+        }
+        return selection;
+    }
+
+    private (string executable, string[] arguments) BuildCommand(
+        string command, string targetLang, string speedProfile, string? sourceFolder,
+        IReadOnlyList<string>? programs = null)
+    {
+        var (executable, arguments) = BaseCommand(command, sourceFolder);
+        return programs is { Count: > 0 }
+            ? (executable, [.. arguments, "--programs", string.Join(',', programs)])
+            : (executable, arguments);
+    }
+
+    private (string executable, string[] arguments) BaseCommand(string command, string? sourceFolder)
+    {
+        var dotnet = "dotnet";
+        var source = $"./{sourceFolder ?? "source"}";
+        var project = Path.Combine(_repoRoot, "CobolToQuarkusMigration.csproj");
+
+        return command.ToLowerInvariant() switch
+        {
+            "migrate" or "run" or "full" =>
+                (dotnet, new[] { "run", "--project", project, "--", "--source", source }),
+
+            "reverse-engineer" or "reverse" or "re" =>
+                (dotnet, new[] { "run", "--project", project, "--", "reverse-engineer", "--source", source, "--output", "output" }),
+
+            "convert-only" or "convert" =>
+                (dotnet, new[] { "run", "--project", project, "--", "--source", source, "--skip-reverse-engineering" }),
+
+            "resume" =>
+                (dotnet, new[] { "run", "--project", project, "--", "--source", source, "--resume" }),
+
+            _ => (dotnet, new[] { "run", "--project", project, "--", "--source", source })
+        };
+    }
+
+    private static void ApplySpeedProfile(IDictionary<string, string?> env, string profile)
+    {
+        switch (profile.ToLowerInvariant())
+        {
+            case "turbo":
+                env["AI_LOW_REASONING_EFFORT"] = "low";
+                env["AI_MEDIUM_REASONING_EFFORT"] = "low";
+                env["AI_HIGH_REASONING_EFFORT"] = "low";
+                env["AI_MAX_OUTPUT_TOKENS"] = "65000";
+                env["AI_MAX_PARALLEL_CONVERSION"] = "4";
+                env["AI_STAGGER_DELAY_MS"] = "200";
+                env["AI_RATE_LIMIT_SAFETY_FACTOR"] = "0.85";
+                break;
+            case "fast":
+                env["AI_LOW_REASONING_EFFORT"] = "low";
+                env["AI_MEDIUM_REASONING_EFFORT"] = "low";
+                env["AI_HIGH_REASONING_EFFORT"] = "medium";
+                env["AI_MAX_OUTPUT_TOKENS"] = "32768";
+                env["AI_MAX_PARALLEL_CONVERSION"] = "3";
+                env["AI_STAGGER_DELAY_MS"] = "500";
+                break;
+            case "thorough":
+                env["AI_LOW_REASONING_EFFORT"] = "high";
+                env["AI_MEDIUM_REASONING_EFFORT"] = "high";
+                env["AI_HIGH_REASONING_EFFORT"] = "high";
+                env["AI_MAX_PARALLEL_CONVERSION"] = "2";
+                env["AI_STAGGER_DELAY_MS"] = "1500";
+                break;
+            default: // balanced
+                env["AI_MAX_PARALLEL_CONVERSION"] = "2";
+                env["AI_STAGGER_DELAY_MS"] = "1000";
+                break;
+        }
+    }
+
+    private async Task CaptureOutputAsync(StreamReader reader, ManagedRun run)
+    {
+        try
+        {
+            string? line;
+            while ((line = await reader.ReadLineAsync()) != null)
+            {
+                run.AppendLog(line);
+            }
+        }
+        catch { /* Process ended */ }
+    }
+
+    private async Task MonitorProcessAsync(ManagedRun run)
+    {
+        if (run.Process == null) return;
+
+        try
+        {
+            await run.Process.WaitForExitAsync();
+            run.ExitCode = run.Process.ExitCode;
+            run.CompletedAt = DateTime.UtcNow;
+
+            if (run.Status == "running")
+            {
+                run.Status = run.Process.ExitCode == 0 ? "completed" : "failed";
+            }
+
+            run.AppendLog($"[PORTAL] Process exited with code {run.Process.ExitCode}");
+            Console.WriteLine($"✅ Run '{run.Name}' finished (exit: {run.Process.ExitCode})");
+        }
+        catch (Exception ex)
+        {
+            run.Status = "failed";
+            run.AppendLog($"[PORTAL] Monitor error: {ex.Message}");
+        }
+    }
+
+    public void Dispose()
+    {
+        foreach (var run in _runs.Values)
+        {
+            if (run.Process != null && !run.Process.HasExited)
+            {
+                try { run.Process.Kill(entireProcessTree: true); } catch { }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Maps a portal provider value to AZURE_OPENAI_SERVICE_TYPE, or null to keep the portal's
+    /// configured provider. There is no GitHub Models client, so "GitHubModels" is rejected
+    /// instead of silently running on the Copilot SDK.
+    /// </summary>
+    public static string? NormalizeProvider(string? provider)
+    {
+        if (string.IsNullOrWhiteSpace(provider))
+            return null;
+
+        return provider.Trim().ToLowerInvariant() switch
+        {
+            "azureopenai" => "AzureOpenAI",
+            "githubcopilot" or "githubcopilotsdk" or "copilotsdk" => "GitHubCopilot",
+            "openai" => "OpenAI",
+            _ => throw new ArgumentException(
+                $"Unsupported provider '{provider}'. Use AzureOpenAI, GitHubCopilot or OpenAI.")
+        };
+    }
+}

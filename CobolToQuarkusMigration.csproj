@@ -1,0 +1,67 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- Run through dotnet.exe rather than a freshly built, unsigned native launcher, which
+         endpoint security (Defender ASR, AppLocker, WDAC) on managed Windows machines may block
+         with "Access is denied". -->
+    <UseAppHost>false</UseAppHost>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Azure.AI.OpenAI" Version="2.1.0" />
+    <PackageReference Include="Azure.Identity" Version="1.17.1" />
+    <PackageReference Include="GitHub.Copilot.SDK" Version="1.0.17" />
+    <PackageReference Include="Microsoft.Extensions.AI" Version="10.0.1" />
+    <PackageReference Include="Microsoft.Extensions.AI.OpenAI" Version="10.3.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="10.0.0" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
+    <PackageReference Include="Neo4j.Driver" Version="5.15.0" />
+    <PackageReference Include="System.CommandLine" Version="2.0.0-beta4.22272.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="McpChatWeb\**\*.cs" />
+    <Compile Remove="McpChatWeb.Tests\**\*.cs" />
+    <Compile Remove="CobolToQuarkusMigration.Tests\**\*.cs" />
+    <EmbeddedResource Include="Jcl\Generation\Templates\*.txt" LogicalName="Jcl.Templates.%(Filename)%(Extension)" WithCulture="false" />
+    <EmbeddedResource Remove="McpChatWeb\**\*" />
+    <EmbeddedResource Remove="McpChatWeb.Tests\**\*" />
+    <EmbeddedResource Remove="CobolToQuarkusMigration.Tests\**\*" />
+    <None Remove="McpChatWeb\**\*" />
+    <None Remove="McpChatWeb.Tests\**\*" />
+    <None Remove="CobolToQuarkusMigration.Tests\**\*" />
+    <Content Remove="McpChatWeb\**\*" />
+    <Content Remove="McpChatWeb.Tests\**\*" />
+    <Content Remove="CobolToQuarkusMigration.Tests\**\*" />
+  </ItemGroup>
+
+<ItemGroup>
+    <None Update="Config\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="Agents\Prompts\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="output\**" />
+  </ItemGroup>
+
+  <!-- Record the Copilot CLI version this SDK package expects so the running app can compare
+       it against the CLI actually on the machine and report a version mismatch instead of an
+       opaque protocol error. Runs as a target rather than a plain ItemGroup so it reads the
+       property after the SDK's props are imported, and no-ops on any SDK that does not define it. -->
+  <Target Name="_EmbedCopilotCliVersion" BeforeTargets="GetAssemblyAttributes" Condition="'$(CopilotCliVersion)' != ''">
+    <ItemGroup>
+      <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+        <_Parameter1>CopilotCliVersion</_Parameter1>
+        <_Parameter2>$(CopilotCliVersion)</_Parameter2>
+      </AssemblyAttribute>
+    </ItemGroup>
+  </Target>
+</Project>
